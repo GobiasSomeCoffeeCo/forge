@@ -1,16 +1,16 @@
 // src/bin/client.rs
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use forge::protocol::{Command, Response};
-use forge::tunnel::Tunnel;
+use forge::protocol::{Command, Response, TunnelDirection};
 use rustls_pemfile::certs;
 use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::{TcpListener, TcpStream};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::{TcpStream, TcpListener};
 use tokio_rustls::rustls::pki_types::{CertificateDer, DnsName, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
@@ -83,6 +83,7 @@ async fn send_command(
     match serde_json::from_str::<Response>(&buf.trim()) {
         Ok(Response::Ok) => Ok(()),
         Ok(Response::Error(e)) => Err(anyhow!("Server error: {}", e)),
+        Ok(Response::TunnelList(_)) => Ok(()),
         Err(e) => Err(anyhow!("Failed to parse server response: {}", e)),
     }
 }
@@ -146,83 +147,117 @@ async fn main() -> Result<()> {
     let mut writer = BufWriter::new(wr);
 
     // 6) Register with server
+    let client_id = format!("client-{}-{}", args.local_port, 
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs());
+    
     let cmd = Command::Register {
-        client_id: format!("client-{}", args.local_port),
+        client_id: client_id.clone(),
     };
     send_command(&mut writer, &mut reader, &cmd).await?;
-    println!("Registered with server");
+    println!("Registered with server as {}", client_id);
 
     // 7) Request tunnel opening
-    let cmd = Command::OpenTunnel {
-        port: args.remote_port,
+    let cmd = Command::CreateTunnel {
+        local_port: args.local_port,
+        target_host: "localhost".to_string(),
+        target_port: args.remote_port,
+        direction: TunnelDirection::Forward,
     };
     send_command(&mut writer, &mut reader, &cmd).await?;
-    println!("Tunnel established to remote port {}", args.remote_port);
+    println!("Tunnel established: localhost:{} -> localhost:{}", 
+        args.local_port, args.remote_port);
 
-    // 8) Start local listener and forwarding
+    // Start local listener
     let local_addr = format!("127.0.0.1:{}", args.local_port);
-    println!("Starting local listener on {}", local_addr);
+    let listener = TcpListener::bind(&local_addr)
+        .await
+        .context("Failed to bind local port")?;
 
-    if args.udp {
-        let mut local_tunnel = Tunnel::new_udp(&local_addr, None).await?;
-        let tcp = TcpStream::connect(&args.server).await?;
-        let tls_stream = create_tls_connection(tcp, client_config, server_name).await?;
-        let mut server_tunnel = Tunnel::TLS(Box::new(tls_stream));
-        println!("UDP tunnel active");
-        local_tunnel.forward_to(&mut server_tunnel).await?;
-    } else {
-        let listener = TcpListener::bind(&local_addr).await?;
-        println!("TCP tunnel active");
-
-        let server_addr = args.server.clone();
-
-        loop {
-            let (socket, peer) = listener.accept().await?;
-            println!("New connection from {}", peer);
-
-            let server_addr = server_addr.clone();
-            let config = client_config.clone();
-            let server_name = server_name.clone();
-            let remote_port = args.remote_port;
-
-            tokio::spawn(async move {
-                let result: Result<()> = async {
-                    let tcp = TcpStream::connect(&server_addr)
-                        .await
-                        .context("Failed to establish TCP connection")?;
-
-                    let tls_stream = create_tls_connection(tcp, config, server_name).await?;
-                    let (rd, wr) = tokio::io::split(tls_stream);
-                    let mut reader = BufReader::new(rd);
-                    let mut writer = BufWriter::new(wr);
-
-                    // Register this connection
-                    let cmd = Command::Register {
-                        client_id: format!("client-{}-{}", peer.port(), remote_port),
-                    };
-                    send_command(&mut writer, &mut reader, &cmd).await?;
-
-                    // Request tunnel opening
-                    let cmd = Command::OpenTunnel { port: remote_port };
-                    send_command(&mut writer, &mut reader, &cmd).await?;
-
-                    // Inside the TCP handling loop:
-                    let mut socket_tunnel = Tunnel::TCP(socket);
-                    let tls_stream = reader.into_inner().unsplit(writer.into_inner());
-                    let mut server_tunnel = Tunnel::TLS(Box::new(tls_stream));
-
-                    // Forward traffic
-                    server_tunnel.forward_to(&mut socket_tunnel).await?;
-                    Ok(())
+// Handle incoming connections
+loop {
+    tokio::select! {
+        accept_result = listener.accept() => {
+            match accept_result {
+                Ok((socket, peer_addr)) => {
+                    println!("New connection from {}", peer_addr);
+                    
+                    // Connect to target
+                    match TcpStream::connect(format!("localhost:{}", args.remote_port)).await {
+                        Ok(target) => {
+                            // Clone necessary handles
+                            let config = client_config.clone();
+                            let server_name = server_name.clone();
+                            let server_addr = args.server.clone();
+                            let client_id = client_id.clone();
+                            
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_connection(
+                                    socket,
+                                    target,
+                                    &server_addr,
+                                    config,
+                                    server_name,
+                                    &client_id,
+                                    args.remote_port
+                                ).await {
+                                    eprintln!("Connection error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to connect to target: {}", e);
+                        }
+                    }
                 }
-                .await;
-
-                if let Err(e) = result {
-                    eprintln!("Connection error for {}: {}", peer, e);
+                Err(e) => {
+                    eprintln!("Failed to accept connection: {}", e);
                 }
-            });
+            }
         }
-    }
+        _ = tokio::signal::ctrl_c() => {
+            println!("Shutting down...");
+            break;
+        }
+    }}
+    
+    Ok(())
+}
 
+async fn handle_connection(
+    mut local_socket: TcpStream,
+    mut target_socket: TcpStream,
+    server_addr: &str,
+    config: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+    client_id: &str,
+    remote_port: u16,
+) -> Result<()> {
+    let (mut local_rd, mut local_wr) = local_socket.split();
+    let (mut target_rd, mut target_wr) = target_socket.split();
+
+    let client_to_target = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = local_rd.read(&mut buf).await?;
+            if n == 0 { break; }
+            target_wr.write_all(&buf[..n]).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    let target_to_client = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = target_rd.read(&mut buf).await?;
+            if n == 0 { break; }
+            local_wr.write_all(&buf[..n]).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    tokio::try_join!(client_to_target, target_to_client)?;
     Ok(())
 }
