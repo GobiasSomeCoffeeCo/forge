@@ -1,128 +1,144 @@
-use anyhow::Result;
-use std::net::{TcpStream, UdpSocket};
-use std::io::{Read, Write};
-use std::thread;
+// src/tunnel.rs
+use anyhow::{anyhow, Context, Result};
+use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio_rustls::rustls::{ClientConfig, ServerConfig};
+use tokio_rustls::rustls::pki_types::{DnsName, ServerName};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+use std::sync::Arc;
+use std::net::IpAddr;
+use std::str::FromStr;
+
+// Make the trait and impl fully public
+pub trait AsyncStream: AsyncRead + AsyncWrite + Send {}
+impl<T: AsyncRead + AsyncWrite + Send> AsyncStream for T {}
 
 pub enum Tunnel {
     TCP(TcpStream),
+    TLS(Box<dyn AsyncStream + Unpin>),
     UDP(UdpSocket),
 }
 
 impl Tunnel {
-    pub fn new_tcp(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+    pub async fn new_tcp(addr: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
         Ok(Tunnel::TCP(stream))
     }
 
-    pub fn new_udp(bind_addr: &str, remote_addr: Option<&str>) -> Result<Self> {
-        let socket = UdpSocket::bind(bind_addr)?;
+    pub async fn new_tls_client(
+        addr: &str, 
+        config: Arc<ClientConfig>,
+        server_name: String,
+    ) -> Result<Self> {
+        // Connect TCP first
+        let tcp = TcpStream::connect(addr)
+            .await
+            .context("Failed to establish TCP connection")?;
+
+        // Convert server name to a static reference and parse as either IP or DNS name
+        let sni = Box::leak(server_name.into_boxed_str()) as &str;
+        let server_name = if let Ok(ip) = IpAddr::from_str(sni) {
+            ServerName::IpAddress(ip.into())
+        } else {
+            let dns_name = DnsName::try_from(sni)
+                .map_err(|_| anyhow!("Invalid server name (neither IP address nor valid DNS name): {}", sni))?;
+            ServerName::DnsName(dns_name)
+        };
+        
+        // Upgrade to TLS
+        let connector = TlsConnector::from(config);
+        let tls_stream = connector
+            .connect(server_name, tcp)
+            .await
+            .context("TLS handshake failed")?;
+
+        Ok(Tunnel::TLS(Box::new(tls_stream)))
+    }
+
+    pub async fn new_tls_server(
+        tcp: TcpStream,
+        config: Arc<ServerConfig>,
+    ) -> Result<Self> {
+        // Upgrade incoming TCP connection to TLS
+        let acceptor = TlsAcceptor::from(config);
+        let tls_stream = acceptor
+            .accept(tcp)
+            .await
+            .context("TLS handshake failed")?;
+
+        Ok(Tunnel::TLS(Box::new(tls_stream)))
+    }
+
+    pub async fn new_udp(bind_addr: &str, remote_addr: Option<&str>) -> Result<Self> {
+        let socket = UdpSocket::bind(bind_addr).await?;
         if let Some(addr) = remote_addr {
-            socket.connect(addr)?;
+            socket.connect(addr).await?;
         }
         Ok(Tunnel::UDP(socket))
     }
 
-    pub fn copy_bidirectional(self, other: TcpStream) -> Result<()> {
-        match self {
-            Tunnel::TCP(stream) => {
-                let mut stream_clone = stream.try_clone()?;
-                let mut other_clone = other.try_clone()?;
-                let mut stream = stream;
-                let mut other = other;
-
-                // Thread for stream -> other
-                let handle1 = thread::spawn(move || {
-                    let mut buf = [0; 16384];
-                    loop {
-                        match stream_clone.read(&mut buf) {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                if other.write_all(&buf[..n]).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                });
-
-                // Thread for other -> stream
-                let handle2 = thread::spawn(move || {
-                    let mut buf = [0; 16384];
-                    loop {
-                        match other_clone.read(&mut buf) {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                if stream.write_all(&buf[..n]).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                });
-
-                // Wait for both copies to complete
-                handle1.join().unwrap();
-                handle2.join().unwrap();
-                Ok(())
+    /// Forward traffic from self to remote_tunnel
+    pub async fn forward_to(&mut self, remote_tunnel: &mut Tunnel) -> Result<()> {
+        match (self, remote_tunnel) {
+            (Tunnel::TCP(local), Tunnel::TCP(remote)) => {
+                io::copy_bidirectional(local, remote).await?;
             }
-            Tunnel::UDP(_) => Err(anyhow::anyhow!("Cannot use TCP operations on UDP tunnel")),
+            (Tunnel::TLS(local), Tunnel::TLS(remote)) => {
+                io::copy_bidirectional(local.as_mut(), remote.as_mut()).await?;
+            }
+            (Tunnel::UDP(local), Tunnel::UDP(remote)) => {
+                const BUFFER_SIZE: usize = 65536;
+                let mut buf = vec![0u8; BUFFER_SIZE];
+                
+                loop {
+                    let n = local.recv(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    remote.send(&buf[..n]).await?;
+                }
+            }
+            _ => {
+                return Err(anyhow!("Mismatched tunnel types for forwarding"));
+            }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_rustls::rustls::{RootCertStore, ClientConfig};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_tls_tunnel_dns() -> Result<()> {
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+
+        let _tunnel = Tunnel::new_tls_client(
+            "localhost:8443",
+            Arc::new(client_config),
+            "localhost".to_string(),
+        ).await?;
+
+        Ok(())
     }
 
-    pub fn copy_bidirectional_udp(self, other: UdpSocket) -> Result<()> {
-        match self {
-            Tunnel::UDP(socket) => {
-                let socket_clone = socket.try_clone()?;
-                let other_clone = other.try_clone()?;
+    #[tokio::test]
+    async fn test_tls_tunnel_ip() -> Result<()> {
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
 
-                // Thread for socket -> other
-                let handle1 = thread::spawn(move || -> Result<()> {
-                    let mut buf = [0; 65507];
-                    loop {
-                        match socket_clone.recv(&mut buf) {
-                            Ok(n) => {
-                                if let Err(e) = other.send(&buf[..n]) {
-                                    eprintln!("UDP send error: {}", e);
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("UDP receive error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    Ok(())
-                });
+        let _tunnel = Tunnel::new_tls_client(
+            "127.0.0.1:8443",
+            Arc::new(client_config),
+            "127.0.0.1".to_string(),
+        ).await?;
 
-                // Thread for other -> socket
-                let handle2 = thread::spawn(move || -> Result<()> {
-                    let mut buf = [0; 65507];
-                    loop {
-                        match other_clone.recv(&mut buf) {
-                            Ok(n) => {
-                                if let Err(e) = socket.send(&buf[..n]) {
-                                    eprintln!("UDP send error: {}", e);
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("UDP receive error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-
-                // Wait for both copies to complete
-                handle1.join().unwrap()?;
-                handle2.join().unwrap()?;
-                Ok(())
-            }
-            Tunnel::TCP(_) => Err(anyhow::anyhow!("Cannot use UDP operations on TCP tunnel")),
-        }
+        Ok(())
     }
 }

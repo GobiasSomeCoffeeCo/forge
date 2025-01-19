@@ -1,136 +1,194 @@
 // src/bin/server.rs
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use forge::protocol::{Command, Response, TunnelSpec};
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use forge::protocol::{Command, Response};
+use forge::tunnel::Tunnel;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pemfile::{certs, pkcs8_private_keys};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpListener;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser)]
-#[command(about = "Tunnel server")]
-struct Args {
-    #[arg(short, long, default_value = "127.0.0.1:8080")]
+struct ServerArgs {
+    /// Address to listen on, e.g. "127.0.0.1:8443"
+    #[arg(long, default_value = "127.0.0.1:8443")]
     addr: String,
+
+    /// Path to server private key (PKCS8 PEM)
+    #[arg(long)]
+    key: PathBuf,
+
+    /// Path to server certificate (PEM)
+    #[arg(long)]
+    cert: PathBuf,
+
+    /// Allow UDP tunnels (default is TCP only)
+    #[arg(long)]
+    allow_udp: bool,
+
+    /// Port range allowed for tunnels (e.g. "1024-65535")
+    #[arg(long, default_value = "1024-65535")]
+    port_range: String,
 }
 
-struct Client {
-    id: String,
-    stream: TcpStream,
-    tunnels: HashMap<u16, TunnelSpec>,
-}
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = ServerArgs::parse();
 
-struct Server {
-    clients: Arc<Mutex<HashMap<String, Client>>>,
-}
+    // Parse port range
+    let port_range: Vec<&str> = args.port_range.split('-').collect();
+    if port_range.len() != 2 {
+        anyhow::bail!("Invalid port range format. Expected 'min-max'");
+    }
+    let min_port = port_range[0].parse::<u16>()
+        .context("Invalid minimum port")?;
+    let max_port = port_range[1].parse::<u16>()
+        .context("Invalid maximum port")?;
 
-impl Server {
-    fn new() -> Self {
-        Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-        }
+    // 1) Load server key pair
+    let key_pem = fs::read(&args.key).context("Failed to read private key file")?;
+    let key = pkcs8_private_keys(&mut &key_pem[..])
+        .map_err(|e| anyhow!("Failed to parse private key: {}", e))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("No private key found in file"))?;
+    let key = PrivateKeyDer::Pkcs8(key.into());
+
+    let cert_pem = fs::read(&args.cert).context("Failed to read certificate file")?;
+    let certs = certs(&mut &cert_pem[..])
+        .map_err(|e| anyhow!("Failed to parse certificate: {}", e))?
+        .into_iter()
+        .map(|cert| CertificateDer::from(cert))
+        .collect::<Vec<_>>();
+
+    if certs.is_empty() {
+        anyhow::bail!("No certificates found in file");
     }
 
-    fn run(&self, addr: &str) -> Result<()> {
-        let listener = TcpListener::bind(addr)?;
-        println!("Server listening on {}", addr);
+    // 2) Build TLS config
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow!("TLS config error: {}", e))?;
+    
+    let acceptor = TlsAcceptor::from(Arc::new(config));
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let clients = Arc::clone(&self.clients);
-                    thread::spawn(move || {
-                        if let Err(e) = Self::handle_client(stream, clients) {
-                            eprintln!("Client error: {}", e);
-                        }
-                    });
-                }
-                Err(e) => eprintln!("Accept error: {}", e),
+    // 3) Bind TCP listener
+    let listener = TcpListener::bind(&args.addr)
+        .await
+        .context("Failed to bind to address")?;
+    println!("Listening on {}", args.addr);
+
+    // 4) Accept connections
+    loop {
+        let (tcp_stream, peer_addr) = listener.accept().await?;
+        println!("TCP connection from {peer_addr}");
+        
+        let acceptor = acceptor.clone();
+        let allow_udp = args.allow_udp;
+        let min_port = min_port;
+        let max_port = max_port;
+
+        // Spawn a new task for each connection
+        tokio::spawn(async move {
+            match handle_connection(tcp_stream, acceptor, allow_udp, min_port, max_port).await {
+                Ok(()) => println!("Connection from {peer_addr} completed"),
+                Err(e) => eprintln!("Error handling connection from {peer_addr}: {e}"),
             }
-        }
-        Ok(())
+        });
     }
+}
 
-    fn handle_client(
-        stream: TcpStream,
-        clients: Arc<Mutex<HashMap<String, Client>>>,
-    ) -> Result<()> {
-        let mut stream = stream;
-        let mut buffer = vec![0; 4096];
+async fn handle_connection(
+    tcp_stream: tokio::net::TcpStream,
+    acceptor: TlsAcceptor,
+    _allow_udp: bool,
+    min_port: u16,
+    max_port: u16,
+) -> Result<()> {
+    // Do TLS handshake
+    let tls_stream = acceptor
+        .accept(tcp_stream)
+        .await
+        .context("TLS handshake failed")?;
+    println!("TLS handshake completed");
 
-        // Handle initial registration
-        match stream.read(&mut buffer) {
-            Ok(n) if n > 0 => {
-                if let Ok(cmd) = serde_json::from_slice(&buffer[..n]) {
-                    match cmd {
-                        Command::Register { client_id } => {
-                            let response = Response::Ok;
-                            stream.write_all(&serde_json::to_vec(&response)?)?;
+    // Split the TLS stream before creating the tunnel
+    let (rd, wr) = tokio::io::split(tls_stream);
+    let mut reader = BufReader::new(rd);
+    let mut writer = BufWriter::new(wr);
+    let mut buf = String::new();
 
-                            let client = Client {
-                                id: client_id.clone(),
-                                stream: stream.try_clone()?,
-                                tunnels: HashMap::new(),
-                            };
-                            clients.lock().unwrap().insert(client_id.clone(), client);
-                            println!("Client registered: {}", client_id);
+    loop {
+        buf.clear();
+        let n = reader
+            .read_line(&mut buf)
+            .await
+            .context("Failed to read command")?;
+
+        if n == 0 {
+            println!("Client closed connection");
+            return Ok(());
+        }
+
+        let cmd: Command = match serde_json::from_str(buf.trim()) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                eprintln!("Invalid command JSON: {e}");
+                let resp = Response::Error(format!("Invalid command JSON: {e}"));
+                send_response(&mut writer, &resp).await?;
+                continue;
+            }
+        };
+
+        println!("Received command: {:?}", cmd);
+
+        let response = match cmd {
+            Command::Register { client_id } => {
+                println!("Client registered: {client_id}");
+                Response::Ok
+            }
+            Command::OpenTunnel { port } => {
+                if port < min_port || port > max_port {
+                    Response::Error(format!("Port {} outside allowed range {}-{}", 
+                        port, min_port, max_port))
+                } else {
+                    println!("Opening tunnel to port {port}");
+                    match Tunnel::new_tcp(&format!("127.0.0.1:{port}")).await {
+                        Ok(target_tunnel) => {
+                            // Create a new TLS connection for the tunnel
+                            Response::Ok
                         }
-                        _ => return Ok(()),
+                        Err(e) => Response::Error(
+                            format!("Failed to connect to local port {}: {}", port, e)
+                        )
                     }
                 }
             }
-            _ => return Ok(()),
-        }
+        };
 
-        // Handle ongoing commands
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break, // Connection closed
-                Ok(n) => {
-                    if let Ok(cmd) = serde_json::from_slice(&buffer[..n]) {
-                        match cmd {
-                            Command::OpenTunnel { spec, client_id } => {
-                                println!(
-                                    "Opening tunnel for client {}: {}:{} -> {}:{}",
-                                    client_id,
-                                    spec.local_host,
-                                    spec.local_port,
-                                    spec.remote_host,
-                                    spec.remote_port
-                                );
-
-                                if let Some(mut guard) = clients.lock().ok() {
-                                    if let Some(client) = guard.get_mut(&client_id) {
-                                        client.tunnels.insert(spec.local_port, spec);
-                                        let response = Response::Ok;
-                                        stream.write_all(&serde_json::to_vec(&response)?)?;
-                                    }
-                                }
-                            }
-                            Command::CloseTunnel { port, client_id } => {
-                                if let Some(mut guard) = clients.lock().ok() {
-                                    if let Some(client) = guard.get_mut(&client_id) {
-                                        client.tunnels.remove(&port);
-                                        let response = Response::Ok;
-                                        stream.write_all(&serde_json::to_vec(&response)?)?;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        Ok(())
+        send_response(&mut writer, &response).await?;
     }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let server = Server::new();
-    server.run(&args.addr)
+async fn send_response(
+    writer: &mut BufWriter<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>>,
+    response: &Response
+) -> Result<()> {
+    let resp_text = serde_json::to_string(response).context("Failed to serialize response")?;
+    writer
+        .write_all(resp_text.as_bytes())
+        .await
+        .context("Failed to write response")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("Failed to write newline")?;
+    writer.flush().await.context("Failed to flush writer")?;
+    Ok(())
 }
