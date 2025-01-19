@@ -3,7 +3,6 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use forge::protocol::{Command, Response};
 use forge::tunnel::Tunnel;
-use tokio_rustls::rustls::pki_types::{CertificateDer, DnsName, ServerName};
 use rustls_pemfile::certs;
 use std::fs;
 use std::net::IpAddr;
@@ -12,6 +11,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls::pki_types::{CertificateDer, DnsName, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
@@ -54,10 +54,43 @@ async fn create_tls_connection(
         .context("TLS handshake failed")
 }
 
+async fn send_command(
+    writer: &mut BufWriter<tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
+    reader: &mut BufReader<tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
+    cmd: &Command,
+) -> Result<()> {
+    let cmd_text = serde_json::to_string(cmd).context("Failed to serialize command")?;
+    writer
+        .write_all(cmd_text.as_bytes())
+        .await
+        .context("Failed to write command")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("Failed to write newline")?;
+    writer.flush().await.context("Failed to flush writer")?;
+
+    let mut buf = String::new();
+    let n = reader
+        .read_line(&mut buf)
+        .await
+        .context("Failed to read response")?;
+
+    if n == 0 {
+        anyhow::bail!("Server closed connection unexpectedly");
+    }
+
+    match serde_json::from_str::<Response>(&buf.trim()) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error(e)) => Err(anyhow!("Server error: {}", e)),
+        Err(e) => Err(anyhow!("Failed to parse server response: {}", e)),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = ClientArgs::parse();
-    
+
     // 1) Load CA cert
     let ca_pem = fs::read(&args.ca).context("Failed reading CA file")?;
     let ca_certs = certs(&mut &ca_pem[..])
@@ -89,12 +122,16 @@ async fn main() -> Result<()> {
     let server_name = if let Ok(ip) = IpAddr::from_str(sni) {
         ServerName::IpAddress(ip.into())
     } else {
-        let dns_name = DnsName::try_from(sni)
-            .map_err(|_| anyhow!("Invalid server name (neither IP address nor valid DNS name): {}", sni))?;
+        let dns_name = DnsName::try_from(sni).map_err(|_| {
+            anyhow!(
+                "Invalid server name (neither IP address nor valid DNS name): {}",
+                sni
+            )
+        })?;
         ServerName::DnsName(dns_name)
     };
 
-    // 5) Initial connection for registration
+    // 5) Initial connection
     let tcp = TcpStream::connect(&args.server)
         .await
         .context("Failed to establish TCP connection")?;
@@ -136,31 +173,49 @@ async fn main() -> Result<()> {
     } else {
         let listener = TcpListener::bind(&local_addr).await?;
         println!("TCP tunnel active");
-        
+
         let server_addr = args.server.clone();
-        let config = client_config.clone();
-        let server_name = server_name.clone();
-        
+
         loop {
             let (socket, peer) = listener.accept().await?;
             println!("New connection from {}", peer);
-            
+
             let server_addr = server_addr.clone();
-            let config = config.clone();
+            let config = client_config.clone();
             let server_name = server_name.clone();
-            
+            let remote_port = args.remote_port;
+
             tokio::spawn(async move {
                 let result: Result<()> = async {
-                    let tcp = TcpStream::connect(&server_addr).await
+                    let tcp = TcpStream::connect(&server_addr)
+                        .await
                         .context("Failed to establish TCP connection")?;
-                    
-                    let tls_stream = create_tls_connection(tcp, config, server_name).await?;
-                    let mut server_tunnel = Tunnel::TLS(Box::new(tls_stream));
-                    let mut local_tunnel = Tunnel::TCP(socket);
 
-                    local_tunnel.forward_to(&mut server_tunnel).await?;
+                    let tls_stream = create_tls_connection(tcp, config, server_name).await?;
+                    let (rd, wr) = tokio::io::split(tls_stream);
+                    let mut reader = BufReader::new(rd);
+                    let mut writer = BufWriter::new(wr);
+
+                    // Register this connection
+                    let cmd = Command::Register {
+                        client_id: format!("client-{}-{}", peer.port(), remote_port),
+                    };
+                    send_command(&mut writer, &mut reader, &cmd).await?;
+
+                    // Request tunnel opening
+                    let cmd = Command::OpenTunnel { port: remote_port };
+                    send_command(&mut writer, &mut reader, &cmd).await?;
+
+                    // Inside the TCP handling loop:
+                    let mut socket_tunnel = Tunnel::TCP(socket);
+                    let tls_stream = reader.into_inner().unsplit(writer.into_inner());
+                    let mut server_tunnel = Tunnel::TLS(Box::new(tls_stream));
+
+                    // Forward traffic
+                    server_tunnel.forward_to(&mut socket_tunnel).await?;
                     Ok(())
-                }.await;
+                }
+                .await;
 
                 if let Err(e) = result {
                     eprintln!("Connection error for {}: {}", peer, e);
@@ -170,37 +225,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-async fn send_command(
-    writer: &mut BufWriter<tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
-    reader: &mut BufReader<tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
-    cmd: &Command,
-) -> Result<()> {
-    let cmd_text = serde_json::to_string(cmd).context("Failed to serialize command")?;
-    writer
-        .write_all(cmd_text.as_bytes())
-        .await
-        .context("Failed to write command")?;
-    writer
-        .write_all(b"\n")
-        .await
-        .context("Failed to write newline")?;
-    writer.flush().await.context("Failed to flush writer")?;
-
-    let mut buf = String::new();
-    let n = reader
-        .read_line(&mut buf)
-        .await
-        .context("Failed to read response")?;
-    
-    if n == 0 {
-        anyhow::bail!("Server closed connection unexpectedly");
-    }
-
-    match serde_json::from_str::<Response>(&buf.trim()) {
-        Ok(Response::Ok) => Ok(()),
-        Ok(Response::Error(e)) => Err(anyhow!("Server error: {}", e)),
-        Err(e) => Err(anyhow!("Failed to parse server response: {}", e)),
-    }
 }

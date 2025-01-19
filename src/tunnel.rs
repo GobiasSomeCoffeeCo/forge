@@ -1,13 +1,13 @@
 // src/tunnel.rs
 use anyhow::{anyhow, Context, Result};
-use tokio::io::{self, AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio_rustls::rustls::{ClientConfig, ServerConfig};
-use tokio_rustls::rustls::pki_types::{DnsName, ServerName};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
-use std::sync::Arc;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio_rustls::rustls::pki_types::{DnsName, ServerName};
+use tokio_rustls::rustls::{ClientConfig, ServerConfig};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // Make the trait and impl fully public
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send {}
@@ -26,7 +26,7 @@ impl Tunnel {
     }
 
     pub async fn new_tls_client(
-        addr: &str, 
+        addr: &str,
         config: Arc<ClientConfig>,
         server_name: String,
     ) -> Result<Self> {
@@ -40,11 +40,15 @@ impl Tunnel {
         let server_name = if let Ok(ip) = IpAddr::from_str(sni) {
             ServerName::IpAddress(ip.into())
         } else {
-            let dns_name = DnsName::try_from(sni)
-                .map_err(|_| anyhow!("Invalid server name (neither IP address nor valid DNS name): {}", sni))?;
+            let dns_name = DnsName::try_from(sni).map_err(|_| {
+                anyhow!(
+                    "Invalid server name (neither IP address nor valid DNS name): {}",
+                    sni
+                )
+            })?;
             ServerName::DnsName(dns_name)
         };
-        
+
         // Upgrade to TLS
         let connector = TlsConnector::from(config);
         let tls_stream = connector
@@ -55,16 +59,10 @@ impl Tunnel {
         Ok(Tunnel::TLS(Box::new(tls_stream)))
     }
 
-    pub async fn new_tls_server(
-        tcp: TcpStream,
-        config: Arc<ServerConfig>,
-    ) -> Result<Self> {
+    pub async fn new_tls_server(tcp: TcpStream, config: Arc<ServerConfig>) -> Result<Self> {
         // Upgrade incoming TCP connection to TLS
         let acceptor = TlsAcceptor::from(config);
-        let tls_stream = acceptor
-            .accept(tcp)
-            .await
-            .context("TLS handshake failed")?;
+        let tls_stream = acceptor.accept(tcp).await.context("TLS handshake failed")?;
 
         Ok(Tunnel::TLS(Box::new(tls_stream)))
     }
@@ -86,10 +84,16 @@ impl Tunnel {
             (Tunnel::TLS(local), Tunnel::TLS(remote)) => {
                 io::copy_bidirectional(local.as_mut(), remote.as_mut()).await?;
             }
+            (Tunnel::TLS(local), Tunnel::TCP(remote)) => {
+                io::copy_bidirectional(local.as_mut(), remote).await?;
+            }
+            (Tunnel::TCP(local), Tunnel::TLS(remote)) => {
+                io::copy_bidirectional(local, remote.as_mut()).await?;
+            }
             (Tunnel::UDP(local), Tunnel::UDP(remote)) => {
                 const BUFFER_SIZE: usize = 65536;
                 let mut buf = vec![0u8; BUFFER_SIZE];
-                
+
                 loop {
                     let n = local.recv(&mut buf).await?;
                     if n == 0 {
@@ -109,8 +113,8 @@ impl Tunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_rustls::rustls::{RootCertStore, ClientConfig};
     use std::sync::Arc;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
     #[tokio::test]
     async fn test_tls_tunnel_dns() -> Result<()> {
@@ -122,7 +126,8 @@ mod tests {
             "localhost:8443",
             Arc::new(client_config),
             "localhost".to_string(),
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -137,7 +142,8 @@ mod tests {
             "127.0.0.1:8443",
             Arc::new(client_config),
             "127.0.0.1".to_string(),
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }

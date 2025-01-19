@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_connection(
-    tcp_stream: tokio::net::TcpStream,
+    tcp_stream: TcpStream,
     acceptor: TlsAcceptor,
     _allow_udp: bool,
     min_port: u16,
@@ -118,7 +118,6 @@ async fn handle_connection(
         .context("TLS handshake failed")?;
     println!("TLS handshake completed");
 
-    // Split the TLS stream before creating the tunnel
     let (rd, wr) = tokio::io::split(tls_stream);
     let mut reader = BufReader::new(rd);
     let mut writer = BufWriter::new(wr);
@@ -148,37 +147,50 @@ async fn handle_connection(
 
         println!("Received command: {:?}", cmd);
 
-        let response = match cmd {
+        match cmd {
             Command::Register { client_id } => {
                 println!("Client registered: {client_id}");
-                Response::Ok
+                send_response(&mut writer, &Response::Ok).await?;
             }
             Command::OpenTunnel { port } => {
                 if port < min_port || port > max_port {
-                    Response::Error(format!("Port {} outside allowed range {}-{}", 
-                        port, min_port, max_port))
-                } else {
-                    println!("Opening tunnel to port {port}");
-                    match Tunnel::new_tcp(&format!("127.0.0.1:{port}")).await {
-                        Ok(target_tunnel) => {
-                            // Create a new TLS connection for the tunnel
-                            Response::Ok
-                        }
-                        Err(e) => Response::Error(
-                            format!("Failed to connect to local port {}: {}", port, e)
-                        )
-                    }
+                    send_response(&mut writer, &Response::Error(
+                        format!("Port {} outside allowed range {}-{}", port, min_port, max_port)
+                    )).await?;
+                    continue;
                 }
-            }
-        };
 
-        send_response(&mut writer, &response).await?;
+                println!("Opening tunnel to port {port}");
+                // Inside handle_connection, in the OpenTunnel match arm:
+let target_stream = match TcpStream::connect(&format!("127.0.0.1:{port}")).await {
+    Ok(stream) => stream,
+    Err(e) => {
+        send_response(&mut writer, &Response::Error(
+            format!("Failed to connect to local port {}: {}", port, e)
+        )).await?;
+        continue;
+    }
+};
+
+// Send success response before starting tunnel
+send_response(&mut writer, &Response::Ok).await?;
+
+// Setup tunnels - swap the order to make both sides match
+let tls_stream = reader.into_inner().unsplit(writer.into_inner());
+let mut server_tunnel = Tunnel::TLS(Box::new(tls_stream));
+let mut target_tunnel = Tunnel::TCP(target_stream);
+
+// Forward traffic
+server_tunnel.forward_to(&mut target_tunnel).await?;
+                return Ok(());
+            }
+        }
     }
 }
 
 async fn send_response(
-    writer: &mut BufWriter<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>>,
-    response: &Response
+    writer: &mut BufWriter<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>,
+    response: &Response,
 ) -> Result<()> {
     let resp_text = serde_json::to_string(response).context("Failed to serialize response")?;
     writer
