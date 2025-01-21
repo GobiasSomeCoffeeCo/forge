@@ -1,5 +1,5 @@
 // src/bin/server.rs
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use forge::protocol::{Command, Response, TunnelDirection, TunnelInfo};
 use rustls_pemfile::{certs, pkcs8_private_keys};
@@ -10,9 +10,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 #[derive(Parser)]
 struct ServerArgs {
@@ -44,7 +44,9 @@ struct ConnectedClient {
 }
 
 impl ConnectedClient {
-    fn new(writer: BufWriter<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>) -> Self {
+    fn new(
+        writer: BufWriter<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>,
+    ) -> Self {
         Self {
             writer: Arc::new(Mutex::new(writer)),
             tunnels: Arc::new(Mutex::new(HashMap::new())),
@@ -64,7 +66,6 @@ struct ServerState {
     clients: HashMap<String, Arc<ConnectedClient>>,
 }
 
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = ServerArgs::parse();
@@ -74,8 +75,12 @@ async fn main() -> Result<()> {
     if port_range.len() != 2 {
         anyhow::bail!("Invalid port range format. Expected 'min-max'");
     }
-    let min_port = port_range[0].parse::<u16>().context("Invalid minimum port")?;
-    let max_port = port_range[1].parse::<u16>().context("Invalid maximum port")?;
+    let min_port = port_range[0]
+        .parse::<u16>()
+        .context("Invalid minimum port")?;
+    let max_port = port_range[1]
+        .parse::<u16>()
+        .context("Invalid maximum port")?;
 
     // Load TLS certificates
     let key_pem = fs::read(&args.key).context("Failed to read private key file")?;
@@ -102,7 +107,7 @@ async fn main() -> Result<()> {
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| anyhow!("TLS config error: {}", e))?;
-    
+
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
     // Create shared server state
@@ -126,7 +131,7 @@ async fn main() -> Result<()> {
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
         println!("TCP connection from {peer_addr}");
-        
+
         let acceptor = acceptor.clone();
         let state = state.clone();
         let allow_udp = args.allow_udp;
@@ -134,14 +139,9 @@ async fn main() -> Result<()> {
         let max_port = max_port;
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client(
-                tcp_stream,
-                acceptor,
-                state,
-                allow_udp,
-                min_port,
-                max_port
-            ).await {
+            if let Err(e) =
+                handle_client(tcp_stream, acceptor, state, allow_udp, min_port, max_port).await
+            {
                 eprintln!("Error handling connection from {peer_addr}: {e}");
             }
         });
@@ -156,139 +156,177 @@ async fn handle_client(
     min_port: u16,
     max_port: u16,
 ) -> Result<()> {
-    let tls_stream = acceptor.accept(tcp_stream).await.context("TLS handshake failed")?;
+    let tls_stream = acceptor
+        .accept(tcp_stream)
+        .await
+        .context("TLS handshake failed")?;
     println!("TLS handshake completed");
 
     let (rd, wr) = tokio::io::split(tls_stream);
     let mut reader = BufReader::new(rd);
+    let writer = BufWriter::new(wr);
     let mut buf = String::new();
     let mut client_id = None;
 
-    // Create the shared writer outside the loop
-    let writer = Arc::new(Mutex::new(BufWriter::new(wr)));
-    let client_writer = writer.clone();
+    let writer = Arc::new(Mutex::new(writer));
 
     loop {
         buf.clear();
-        let n = reader.read_line(&mut buf).await.context("Failed to read command")?;
+        let n = reader
+            .read_line(&mut buf)
+            .await
+            .context("Failed to read command")?;
 
         if n == 0 {
-            if let Some(id) = client_id {
+            if let Some(id) = client_id.as_ref() {
                 let mut state = state.lock().await;
-                state.clients.remove(&id);
+                state.clients.remove(id);
                 println!("Client {id} disconnected");
             }
             return Ok(());
         }
 
-        let cmd: Command = match serde_json::from_str(buf.trim()) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                eprintln!("Invalid command JSON: {e}");
-                continue;
-            }
-        };
+        // Try to parse message as a Command first
+        let parsed_command = serde_json::from_str::<Command>(&buf.trim());
+        
+        // Handle the message based on whether it's a command or not
+        match parsed_command {
+            Ok(cmd) => {
+                println!("Received command: {:?}", cmd);
 
-        println!("Received command: {:?}", cmd);
-
-        match cmd {
-            Command::Register { client_id: id } => {
-                let mut state = state.lock().await;
-                let client = Arc::new(ConnectedClient {
-                    writer: client_writer.clone(),
-                    tunnels: Arc::new(Mutex::new(HashMap::new())),
-                });
-                state.clients.insert(id.clone(), client.clone());
-                client_id = Some(id.clone());
-                println!("Client registered: {id}");
-                
-                let mut writer = client_writer.lock().await;
-                send_response(&mut *writer, &Response::Ok).await?;
-            }
-            Command::CreateTunnel { local_port, target_host, target_port, direction } => {
-                if let Some(ref id) = client_id {
-                    let state = state.lock().await;
-                    if let Some(client) = state.clients.get(id) {
-                        if local_port < min_port || local_port > max_port {
-                            let mut writer = client.writer.lock().await;
-                            send_response(&mut *writer, &Response::Error(
-                                format!("Port {} outside allowed range {}-{}", local_port, min_port, max_port)
-                            )).await?;
-                            continue;
-                        }
-
-                        let mut tunnels = client.tunnels.lock().await;
-                        tunnels.insert(local_port, TunnelInfo {
-                            local_port,
-                            target_host,
-                            target_port,
-                            direction,
-                            bytes_sent: 0,
-                            bytes_received: 0,
+                match cmd {
+                    Command::Register { client_id: id } => {
+                        let mut state = state.lock().await;
+                        let client = Arc::new(ConnectedClient {
+                            writer: writer.clone(),
+                            tunnels: Arc::new(Mutex::new(HashMap::new())),
                         });
-                        
+                        state.clients.insert(id.clone(), client.clone());
+                        client_id = Some(id.clone());
+                        println!("Client registered: {id}");
+
                         let mut writer = client.writer.lock().await;
                         send_response(&mut *writer, &Response::Ok).await?;
                     }
-                }
-            }
-            Command::ModifyTunnel { local_port, new_target_host, new_target_port } => {
-                if let Some(ref id) = client_id {
-                    let state = state.lock().await;
-                    if let Some(client) = state.clients.get(id) {
-                        let mut tunnels = client.tunnels.lock().await;
-                        let mut writer = client.writer.lock().await;
-                        
-                        if let Some(tunnel) = tunnels.get_mut(&local_port) {
-                            tunnel.target_host = new_target_host;
-                            tunnel.target_port = new_target_port;
-                            send_response(&mut *writer, &Response::Ok).await?;
-                        } else {
-                            send_response(&mut *writer, &Response::Error(
-                                format!("No tunnel found on port {}", local_port)
-                            )).await?;
+                    Command::CreateTunnel {
+                        local_port,
+                        target_host,
+                        target_port,
+                        direction,
+                    } => {
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                if local_port < min_port || local_port > max_port {
+                                    let mut writer = client.writer.lock().await;
+                                    send_response(
+                                        &mut *writer,
+                                        &Response::Error(format!(
+                                            "Port {} outside allowed range {}-{}",
+                                            local_port, min_port, max_port
+                                        )),
+                                    ).await?;
+                                    continue;
+                                }
+
+                                let mut tunnels = client.tunnels.lock().await;
+                                tunnels.insert(local_port, TunnelInfo {
+                                    local_port,
+                                    target_host,
+                                    target_port,
+                                    direction,
+                                    bytes_sent: 0,
+                                    bytes_received: 0,
+                                });
+
+                                let mut writer = client.writer.lock().await;
+                                send_response(&mut *writer, &Response::Ok).await?;
+                            }
+                        }
+                    }
+                    Command::ModifyTunnel {
+                        old_local_port,
+                        new_local_port,
+                        new_target_host,
+                        new_target_port,
+                    } => {
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                let mut tunnels = client.tunnels.lock().await;
+                                
+                                // Remove old tunnel while preserving stats if they exist
+                                let old_stats = tunnels.remove(&old_local_port)
+                                    .map(|t| (t.bytes_sent, t.bytes_received))
+                                    .unwrap_or((0, 0));
+        
+                                // Create new tunnel info with preserved stats
+                                let new_tunnel = TunnelInfo {
+                                    local_port: new_local_port,
+                                    target_host: new_target_host.clone(),
+                                    target_port: new_target_port,
+                                    direction: TunnelDirection::Forward,
+                                    bytes_sent: old_stats.0,
+                                    bytes_received: old_stats.1,
+                                };
+        
+                                // Insert new tunnel info
+                                tunnels.insert(new_local_port, new_tunnel);
+        
+                                let mut writer = client.writer.lock().await;
+                                send_response(&mut *writer, &Response::Ok).await?;
+                                
+                                println!(
+                                    "Updated tunnel mapping for client {}: {}:{} -> {}:{}",
+                                    id, "localhost", new_local_port, new_target_host, new_target_port
+                                );
+                            }
+                        }
+                    }
+                    Command::CloseTunnel { local_port } => {
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                let mut tunnels = client.tunnels.lock().await;
+                                tunnels.remove(&local_port);
+
+                                let mut writer = client.writer.lock().await;
+                                send_response(&mut *writer, &Response::Ok).await?;
+                            }
+                        }
+                    }
+                    Command::ListTunnels => {
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                let tunnels = client.tunnels.lock().await;
+                                let tunnel_list: Vec<TunnelInfo> = tunnels.values().cloned().collect();
+
+                                let mut writer = client.writer.lock().await;
+                                send_response(&mut *writer, &Response::TunnelList(tunnel_list)).await?;
+                            }
                         }
                     }
                 }
             }
-            Command::CloseTunnel { local_port } => {
-                if let Some(ref id) = client_id {
-                    let state = state.lock().await;
-                    if let Some(client) = state.clients.get(id) {
-                        let mut tunnels = client.tunnels.lock().await;
-                        tunnels.remove(&local_port);
-                        
-                        let mut writer = client.writer.lock().await;
-                        send_response(&mut *writer, &Response::Ok).await?;
+            Err(e) => {
+                // If it's not a command, try to parse as a Response
+                match serde_json::from_str::<Response>(&buf.trim()) {
+                    Ok(response) => {
+                        println!("Received response from client: {:?}", response);
+                        // Handle client response if needed
+                        continue;
                     }
-                }
-            }
-            Command::ListTunnels => {
-                if let Some(ref id) = client_id {
-                    let state = state.lock().await;
-                    if let Some(client) = state.clients.get(id) {
-                        let tunnels = client.tunnels.lock().await;
-                        let tunnel_list: Vec<TunnelInfo> = tunnels.values().cloned().collect();
-                        
-                        let mut writer = client.writer.lock().await;
-                        send_response(&mut *writer, &Response::TunnelList(tunnel_list)).await?;
-                    }
-                }
-            }
-            Command::OpenTunnel { port } => {
-                // Legacy command support
-                if let Some(ref id) = client_id {
-                    let state = state.lock().await;
-                    if let Some(client) = state.clients.get(id) {
-                        let mut writer = client.writer.lock().await;
-                        send_response(&mut *writer, &Response::Ok).await?;
+                    Err(_) => {
+                        // If it's neither a command nor a response, it's an error
+                        eprintln!("Invalid message format: {}", e);
+                        continue;
                     }
                 }
             }
         }
     }
 }
-
 
 async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
     let mut stdin = BufReader::new(tokio::io::stdin());
@@ -298,7 +336,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
 
     loop {
         buf.clear();
-        print!("> ");
+        print!("forge> ");
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         if stdin.read_line(&mut buf).await.unwrap() == 0 {
@@ -315,7 +353,9 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                 println!("Available commands:");
                 println!("  clients                     - List connected clients");
                 println!("  tunnels <client_id>         - List tunnels for a client");
-                println!("  create <client_id> <local_port> <target_host> <target_port> [-r] - Create tunnel");
+                println!(
+                    "  create <client_id> <local_port> <target_host> <target_port> [-r] - Create tunnel"
+                );
                 println!("  modify <client_id> <local_port> <new_host> <new_port> - Modify tunnel");
                 println!("  close <client_id> <local_port> - Close tunnel");
                 println!("  exit                        - Shut down server");
@@ -338,10 +378,14 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                     let tunnels = client.tunnels.lock().await;
                     println!("Active tunnels for {}:", parts[1]);
                     for tunnel in tunnels.values() {
-                        println!("  {}:{} -> {}:{} ({:?})",
-                            "localhost", tunnel.local_port,
-                            tunnel.target_host, tunnel.target_port,
-                            tunnel.direction);
+                        println!(
+                            "  {}:{} -> {}:{} ({:?})",
+                            "localhost",
+                            tunnel.local_port,
+                            tunnel.target_host,
+                            tunnel.target_port,
+                            tunnel.direction
+                        );
                     }
                 } else {
                     println!("Client {} not found", parts[1]);
@@ -349,7 +393,9 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
             }
             "create" => {
                 if parts.len() < 5 {
-                    println!("Usage: create <client_id> <local_port> <target_host> <target_port> [-r]");
+                    println!(
+                        "Usage: create <client_id> <local_port> <target_host> <target_port> [-r]"
+                    );
                     continue;
                 }
 
@@ -418,7 +464,8 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                 let state = state.lock().await;
                 if let Some(client) = state.clients.get(client_id) {
                     let cmd = Command::ModifyTunnel {
-                        local_port,
+                        old_local_port: local_port,
+                        new_local_port: local_port, // Keep same local port
                         new_target_host,
                         new_target_port,
                     };

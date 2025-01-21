@@ -18,15 +18,15 @@ pub enum Command {
         direction: TunnelDirection,
     },
     ModifyTunnel {
-        local_port: u16,
-        new_target_host: String,
-        new_target_port: u16,
+        old_local_port: u16,    // Current local port
+        new_local_port: u16,    // New local port to listen on
+        new_target_host: String,  // New target IP/hostname
+        new_target_port: u16,     // New target port
     },
     CloseTunnel {
         local_port: u16,
     },
     ListTunnels,
-    OpenTunnel { port: u16 }, // Keep this temporarily for backward compatibility
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
