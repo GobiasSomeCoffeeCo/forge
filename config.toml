@@ -1,0 +1,3 @@
+server_address = "127.0.0.1:8443"
+server_sni = "127.0.0.1"  # Optional, defaults to server address
+ca_cert = "ca-cert.pem"  # Path relative to project root

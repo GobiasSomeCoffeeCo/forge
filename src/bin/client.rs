@@ -1,7 +1,10 @@
+include!(concat!(env!("OUT_DIR"), "/config.rs"));
+
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use forge::protocol::{Command, Response, TunnelDirection, TunnelInfo};
 use rustls_pemfile::certs;
+use toml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
@@ -363,18 +366,39 @@ async fn handle_server_commands(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = ClientArgs::parse();
+    // Read and parse config.toml
+    let config_str = fs::read_to_string("config.toml")
+        .context("Failed to read config.toml")?;
+    let config: Value = toml::from_str(&config_str)
+        .context("Failed to parse config.toml")?;
 
-    // Load CA cert and set up TLS config
-    let ca_pem = fs::read(&args.ca).context("Failed reading CA file")?;
-    let ca_certs = certs(&mut &ca_pem[..])
+    // Extract values from config early and own them
+    let server_address = config["server_address"].as_str()
+        .ok_or_else(|| anyhow!("server_address not found in config"))?
+        .to_string();
+    
+        let server_sni: &'static str = Box::leak(match config["server_sni"].as_str() {
+            Some(sni) => sni.to_string().into_boxed_str(),
+            None => server_address.split(':').next().unwrap().to_string().into_boxed_str()
+        });
+
+    let ca_cert_path = config["ca_cert"].as_str()
+        .ok_or_else(|| anyhow!("ca_cert not found in config"))?
+        .to_string();
+
+    // Read CA certificate
+    let ca_cert = fs::read_to_string(&ca_cert_path)
+        .context("Failed to read CA certificate")?;
+
+    // Parse the CA cert
+    let ca_certs = certs(&mut ca_cert.as_bytes())
         .map_err(|e| anyhow!("Failed to parse CA cert: {}", e))?
         .into_iter()
         .map(|cert| CertificateDer::from(cert))
         .collect::<Vec<_>>();
 
     if ca_certs.is_empty() {
-        anyhow::bail!("No CA certs found in file");
+        anyhow::bail!("No CA certs found in certificate");
     }
 
     let mut root_store = RootCertStore::empty();
@@ -390,15 +414,29 @@ async fn main() -> Result<()> {
     let client_config = Arc::new(config);
 
     // Set up server name for TLS
-    let sni = Box::leak(args.sni.into_boxed_str()) as &str;
-    let server_name = if let Ok(ip) = IpAddr::from_str(sni) {
+    let server_name = if let Ok(ip) = IpAddr::from_str(&server_sni) {
         ServerName::IpAddress(ip.into())
     } else {
-        let dns_name = DnsName::try_from(sni).map_err(|_| {
-            anyhow!("Invalid server name (neither IP address nor valid DNS name): {}", sni)
+        let dns_name = DnsName::try_from(server_sni).map_err(|_| {
+            anyhow!("Invalid server name (neither IP address nor valid DNS name): {}", server_sni)
         })?;
         ServerName::DnsName(dns_name)
     };
+
+    // Initialize tunnel manager
+    let tunnel_manager = Arc::new(TunnelManager::new());
+    
+    // Set up command channel connection
+    println!("Establishing command channel connection to {}...", server_address);
+    let cmd_tcp = TcpStream::connect(&server_address)
+        .await
+        .context("Failed to establish command TCP connection")?;
+    let cmd_tls = create_tls_connection(cmd_tcp, client_config, server_name).await?;
+    println!("Command channel TLS established");
+
+    let (cmd_rd, cmd_wr) = tokio::io::split(cmd_tls);
+    let mut cmd_reader = BufReader::new(cmd_rd);
+    let mut cmd_writer = BufWriter::new(cmd_wr);
 
     // Generate a unique client ID
     let client_id = format!(
@@ -408,21 +446,6 @@ async fn main() -> Result<()> {
             .unwrap()
             .as_secs()
     );
-
-    // Initialize tunnel manager
-    let tunnel_manager = Arc::new(TunnelManager::new());
-    
-    // Set up command channel connection
-    println!("Establishing command channel connection...");
-    let cmd_tcp = TcpStream::connect(&args.server)
-        .await
-        .context("Failed to establish command TCP connection")?;
-    let cmd_tls = create_tls_connection(cmd_tcp, client_config, server_name).await?;
-    println!("Command channel TLS established");
-
-    let (cmd_rd, cmd_wr) = tokio::io::split(cmd_tls);
-    let mut cmd_reader = BufReader::new(cmd_rd);
-    let mut cmd_writer = BufWriter::new(cmd_wr);
 
     // Register with server
     let register_cmd = Command::Register {
