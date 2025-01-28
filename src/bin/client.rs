@@ -366,40 +366,17 @@ async fn handle_server_commands(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Read and parse config.toml
-    let config_str = fs::read_to_string("config.toml")
-        .context("Failed to read config.toml")?;
-    let config: Value = toml::from_str(&config_str)
-        .context("Failed to parse config.toml")?;
+    // Use the embedded constants directly
+    let server_address = SERVER_ADDRESS;
+    let server_sni = SERVER_SNI;
+    let ca_cert = CA_CERT;
 
-    // Extract values from config early and own them
-    let server_address = config["server_address"].as_str()
-        .ok_or_else(|| anyhow!("server_address not found in config"))?
-        .to_string();
-    
-        let server_sni: &'static str = Box::leak(match config["server_sni"].as_str() {
-            Some(sni) => sni.to_string().into_boxed_str(),
-            None => server_address.split(':').next().unwrap().to_string().into_boxed_str()
-        });
-
-    let ca_cert_path = config["ca_cert"].as_str()
-        .ok_or_else(|| anyhow!("ca_cert not found in config"))?
-        .to_string();
-
-    // Read CA certificate
-    let ca_cert = fs::read_to_string(&ca_cert_path)
-        .context("Failed to read CA certificate")?;
-
-    // Parse the CA cert
+    // Parse the embedded CA cert
     let ca_certs = certs(&mut ca_cert.as_bytes())
         .map_err(|e| anyhow!("Failed to parse CA cert: {}", e))?
         .into_iter()
         .map(|cert| CertificateDer::from(cert))
         .collect::<Vec<_>>();
-
-    if ca_certs.is_empty() {
-        anyhow::bail!("No CA certs found in certificate");
-    }
 
     let mut root_store = RootCertStore::empty();
     for cert in ca_certs {

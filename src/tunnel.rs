@@ -1,150 +1,289 @@
 // src/tunnel.rs
 use anyhow::{anyhow, Context, Result};
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{self, AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_rustls::rustls::pki_types::{DnsName, ServerName};
 use tokio_rustls::rustls::{ClientConfig, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-// Make the trait and impl fully public
-pub trait AsyncStream: AsyncRead + AsyncWrite + Send {}
-impl<T: AsyncRead + AsyncWrite + Send> AsyncStream for T {}
+const MAX_MESSAGE_SIZE: usize = 16384; // 16KB max message size
 
-pub enum Tunnel {
-    TCP(TcpStream),
-    TLS(Box<dyn AsyncStream + Unpin>),
-    UDP(UdpSocket),
+pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum TunnelMessage {
+    // Control messages
+    OpenChannel {
+        channel_id: u32,
+        direction: TunnelDirection,
+        target_host: String,
+        target_port: u16,
+    },
+    CloseChannel {
+        channel_id: u32,
+    },
+    // Data messages
+    Data {
+        channel_id: u32,
+        data: Vec<u8>,
+    },
 }
 
-impl Tunnel {
-    pub async fn new_tcp(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        Ok(Tunnel::TCP(stream))
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum TunnelDirection {
+    Forward,  // Local -> Remote (like SSH -L)
+    Reverse,  // Remote -> Local (like SSH -R)
+}
+
+#[derive(Debug)]
+struct Channel {
+    id: u32,
+    direction: TunnelDirection,
+    target_host: String,
+    target_port: u16,
+    bytes_sent: u64,
+    bytes_received: u64,
+}
+
+pub struct MultiplexedTunnel {
+    tls_stream: Box<dyn AsyncStream>,
+    channels: HashMap<u32, Channel>,
+    next_channel_id: u32,
+}
+
+impl MultiplexedTunnel {
+    pub fn new(tls_stream: Box<dyn AsyncStream>) -> Self {
+        Self {
+            tls_stream,
+            channels: HashMap::new(),
+            next_channel_id: 1,
+        }
     }
 
-    pub async fn new_tls_client(
-        addr: &str,
-        config: Arc<ClientConfig>,
-        server_name: String,
-    ) -> Result<Self> {
-        // Connect TCP first
-        let tcp = TcpStream::connect(addr)
-            .await
-            .context("Failed to establish TCP connection")?;
+    pub async fn open_channel(
+        &mut self,
+        direction: TunnelDirection,
+        target_host: String,
+        target_port: u16,
+    ) -> Result<u32> {
+        let channel_id = self.next_channel_id;
+        self.next_channel_id += 1;
 
-        // Convert server name to a static reference and parse as either IP or DNS name
-        let sni = Box::leak(server_name.into_boxed_str()) as &str;
-        let server_name = if let Ok(ip) = IpAddr::from_str(sni) {
-            ServerName::IpAddress(ip.into())
-        } else {
-            let dns_name = DnsName::try_from(sni).map_err(|_| {
-                anyhow!(
-                    "Invalid server name (neither IP address nor valid DNS name): {}",
-                    sni
-                )
-            })?;
-            ServerName::DnsName(dns_name)
+        let msg = TunnelMessage::OpenChannel {
+            channel_id,
+            direction,
+            target_host: target_host.clone(),
+            target_port,
         };
 
-        // Upgrade to TLS
-        let connector = TlsConnector::from(config);
-        let tls_stream = connector
-            .connect(server_name, tcp)
-            .await
-            .context("TLS handshake failed")?;
+        self.send_message(&msg).await?;
 
-        Ok(Tunnel::TLS(Box::new(tls_stream)))
+        self.channels.insert(
+            channel_id,
+            Channel {
+                id: channel_id,
+                direction,
+                target_host,
+                target_port,
+                bytes_sent: 0,
+                bytes_received: 0,
+            },
+        );
+
+        Ok(channel_id)
     }
 
-    pub async fn new_tls_server(tcp: TcpStream, config: Arc<ServerConfig>) -> Result<Self> {
-        // Upgrade incoming TCP connection to TLS
-        let acceptor = TlsAcceptor::from(config);
-        let tls_stream = acceptor.accept(tcp).await.context("TLS handshake failed")?;
-
-        Ok(Tunnel::TLS(Box::new(tls_stream)))
-    }
-
-    pub async fn new_udp(bind_addr: &str, remote_addr: Option<&str>) -> Result<Self> {
-        let socket = UdpSocket::bind(bind_addr).await?;
-        if let Some(addr) = remote_addr {
-            socket.connect(addr).await?;
+    pub async fn close_channel(&mut self, channel_id: u32) -> Result<()> {
+        if self.channels.remove(&channel_id).is_some() {
+            let msg = TunnelMessage::CloseChannel { channel_id };
+            self.send_message(&msg).await?;
         }
-        Ok(Tunnel::UDP(socket))
+        Ok(())
     }
 
-    /// Forward traffic from self to remote_tunnel
-    pub async fn forward_to(&mut self, remote_tunnel: &mut Tunnel) -> Result<()> {
-        match (self, remote_tunnel) {
-            (Tunnel::TCP(local), Tunnel::TCP(remote)) => {
-                io::copy_bidirectional(local, remote).await?;
-            }
-            (Tunnel::TLS(local), Tunnel::TLS(remote)) => {
-                io::copy_bidirectional(local.as_mut(), remote.as_mut()).await?;
-            }
-            (Tunnel::TLS(local), Tunnel::TCP(remote)) => {
-                io::copy_bidirectional(local.as_mut(), remote).await?;
-            }
-            (Tunnel::TCP(local), Tunnel::TLS(remote)) => {
-                io::copy_bidirectional(local, remote.as_mut()).await?;
-            }
-            (Tunnel::UDP(local), Tunnel::UDP(remote)) => {
-                const BUFFER_SIZE: usize = 65536;
-                let mut buf = vec![0u8; BUFFER_SIZE];
+    pub async fn send_data(&mut self, channel_id: u32, data: &[u8]) -> Result<()> {
+        let bytes_len = data.len() as u64;
+        
+        let msg = TunnelMessage::Data {
+            channel_id,
+            data: data.to_vec(),
+        };
+        
+        self.send_message(&msg).await?;
+        
+        // Update bytes sent after successful send
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            channel.bytes_sent += bytes_len;
+        }
+        
+        Ok(())
+    }
 
-                loop {
-                    let n = local.recv(&mut buf).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    remote.send(&buf[..n]).await?;
-                }
-            }
-            _ => {
-                return Err(anyhow!("Mismatched tunnel types for forwarding"));
+    async fn send_message(&mut self, msg: &TunnelMessage) -> Result<()> {
+        let data = serde_json::to_vec(msg)?;
+        let len = data.len() as u32;
+        if len > MAX_MESSAGE_SIZE as u32 {
+            return Err(anyhow!("Message too large"));
+        }
+        
+        self.tls_stream.write_u32_le(len).await?;
+        self.tls_stream.write_all(&data).await?;
+        self.tls_stream.flush().await?;
+        Ok(())
+    }
+
+    pub async fn receive_message(&mut self) -> Result<TunnelMessage> {
+        let len = self.tls_stream.read_u32_le().await? as usize;
+        if len > MAX_MESSAGE_SIZE {
+            return Err(anyhow!("Message too large"));
+        }
+
+        let mut data = vec![0u8; len];
+        self.tls_stream.read_exact(&mut data).await?;
+        
+        let msg: TunnelMessage = serde_json::from_slice(&data)?;
+        
+        if let TunnelMessage::Data { channel_id, ref data } = msg {
+            if let Some(channel) = self.channels.get_mut(&channel_id) {
+                channel.bytes_received += data.len() as u64;
             }
         }
+        
+        Ok(msg)
+    }
+}
+
+pub struct TunnelManager {
+    multiplexer: Arc<Mutex<MultiplexedTunnel>>,
+}
+
+impl TunnelManager {
+    pub fn new(tls_stream: Box<dyn AsyncStream>) -> Self {
+        Self {
+            multiplexer: Arc::new(Mutex::new(MultiplexedTunnel::new(tls_stream))),
+        }
+    }
+
+    pub async fn create_forward_tunnel(
+        &self,
+        local_port: u16,
+        target_host: String,
+        target_port: u16,
+    ) -> Result<()> {
+        let mut multiplexer = self.multiplexer.lock().await;
+        let channel_id = multiplexer.open_channel(
+            TunnelDirection::Forward,
+            target_host,
+            target_port,
+        ).await?;
+        drop(multiplexer); // Release the lock before spawning
+
+        // Start local listener
+        let multiplexer_clone = self.multiplexer.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_local_listener(local_port, channel_id, multiplexer_clone).await {
+                eprintln!("Forward tunnel error: {}", e);
+            }
+        });
+
+        Ok(())
+    }
+
+    pub async fn create_reverse_tunnel(
+        &self,
+        _remote_port: u16, // Prefix with _ to silence warning
+        local_host: String,
+        local_port: u16,
+    ) -> Result<()> {
+        let mut multiplexer = self.multiplexer.lock().await;
+        multiplexer.open_channel(
+            TunnelDirection::Reverse,
+            local_host,
+            local_port,
+        ).await?;
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+async fn handle_local_listener(
+    local_port: u16,
+    channel_id: u32,
+    multiplexer: Arc<Mutex<MultiplexedTunnel>>,
+) -> Result<()> {
+    use tokio::net::TcpListener;
 
-    #[tokio::test]
-    async fn test_tls_tunnel_dns() -> Result<()> {
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(RootCertStore::empty())
-            .with_no_client_auth();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", local_port)).await?;
 
-        let _tunnel = Tunnel::new_tls_client(
-            "localhost:8443",
-            Arc::new(client_config),
-            "localhost".to_string(),
-        )
-        .await?;
+    loop {
+        let (socket, _) = listener.accept().await?;
+        let multiplexer = multiplexer.clone();
+        
+        tokio::spawn(async move {
+            if let Err(e) = handle_local_connection(socket, channel_id, multiplexer).await {
+                eprintln!("Connection error: {}", e);
+            }
+        });
+    }
+}
 
-        Ok(())
+async fn handle_local_connection(
+    mut socket: TcpStream,
+    channel_id: u32,
+    multiplexer: Arc<Mutex<MultiplexedTunnel>>,
+) -> Result<()> {
+    let (mut socket_rd, _) = socket.split();
+    let mut buf = vec![0u8; 8192];
+
+    loop {
+        let n = socket_rd.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        let mut multiplexer = multiplexer.lock().await;
+        multiplexer.send_data(channel_id, &buf[..n]).await?;
     }
 
-    #[tokio::test]
-    async fn test_tls_tunnel_ip() -> Result<()> {
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(RootCertStore::empty())
-            .with_no_client_auth();
+    Ok(())
+}
 
-        let _tunnel = Tunnel::new_tls_client(
-            "127.0.0.1:8443",
-            Arc::new(client_config),
-            "127.0.0.1".to_string(),
-        )
-        .await?;
 
-        Ok(())
-    }
+// Helper functions for TLS setup
+pub async fn create_client_connection(
+    addr: &str,
+    config: Arc<ClientConfig>,
+    server_name: String,
+) -> Result<Box<dyn AsyncStream>> {
+    let tcp = TcpStream::connect(addr).await?;
+    
+    let server_name = if let Ok(ip) = IpAddr::from_str(&server_name) {
+        ServerName::IpAddress(ip.into())
+    } else {
+        // Convert to static string and then get a reference to it
+        let static_name = Box::leak(server_name.clone().into_boxed_str());
+        let dns_name = DnsName::try_from(&*static_name)
+            .map_err(|_| anyhow!("Invalid DNS name"))?;
+        ServerName::DnsName(dns_name)
+    };
+
+    let connector = TlsConnector::from(config);
+    let tls_stream = connector.connect(server_name, tcp).await?;
+    
+    Ok(Box::new(tls_stream))
+}
+
+pub async fn create_server_connection(
+    tcp: TcpStream,
+    config: Arc<ServerConfig>,
+) -> Result<Box<dyn AsyncStream>> {
+    let acceptor = TlsAcceptor::from(config);
+    let tls_stream = acceptor.accept(tcp).await?;
+    Ok(Box::new(tls_stream))
 }
