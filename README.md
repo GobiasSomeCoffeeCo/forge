@@ -1,4 +1,4 @@
-# Forge - TCP Tunneling Tool (Work in Progress)
+# Forge - TCP Tunneling Tool
 
 Forge is a TCP tunneling tool written in Rust that allows you to create tunnels between hosts with a TLS-encrypted command channel for secure tunnel management. The actual tunnel traffic is transported over direct (unsecured) TCP connections.
 
@@ -11,6 +11,7 @@ Forge is a TCP tunneling tool written in Rust that allows you to create tunnels 
 - **Target Flexibility**: Dynamically update target hosts and ports for existing tunnels
 - **Secure Command Channel**: Control messages are sent over a TLS-encrypted connection
 - **Interactive Management**: Command-line interface for managing tunnels
+- **Network Routing**: Connect to any machine reachable from the client, including internal LAN networks and subnets
 
 ## Prerequisites
 
@@ -36,6 +37,37 @@ Forge is a TCP tunneling tool written in Rust that allows you to create tunnels 
    ```bash
    ./client
    ```
+
+## Usage Examples
+
+### Multiple Clients
+You can deploy the client to multiple machines in your network. Each client automatically generates a unique ID based on timestamp, making it easy to manage multiple connections:
+
+```bash
+# Copy the client binary and config to multiple machines
+scp client machine1:/opt/forge/
+scp client machine2:/opt/forge/
+scp client machine3:/opt/forge/
+
+# Each client will connect with its own unique ID
+# On the server you'll see them as different clients:
+forge> clients
+Connected clients:
+  client-1706511234
+  client-1706511245
+  client-1706511256
+```
+
+### Internal Network Access
+If your client is on a LAN (e.g., 192.168.1.0/24), you can create tunnels to any reachable machine:
+
+```bash
+# On the server
+forge> create client-1234 8080 192.168.1.50 80    # Access internal web server
+forge> create client-1234 3389 192.168.1.100 3389  # Access internal RDP server
+```
+
+This allows the server to access machines that are only reachable from the client's network.
 
 ## Configuration
 
@@ -87,26 +119,12 @@ The project implements several security measures:
 - **MultiplexedTunnel**: Manages multiple logical connections over a single TLS connection
 - **Protocol**: Defines the command and control protocol between client and server
 
-### Message Types
-
-- **OpenChannel**: Creates a new tunnel
-- **CloseChannel**: Terminates an existing tunnel
-- **Data**: Carries tunnel traffic
-- **Command/Response**: Control messages for tunnel management
-
-## Building from Source
-
-1. Ensure you have Rust and Cargo installed
-2. Clone the repository
-3. Run `cargo build --release`
-4. The binaries will be available in `target/release/`
 
 ## Limitations
 
 - Currently supports TCP tunnels only (UDP support planned)
 - No built-in authentication beyond TLS certificates
 - TCP tunnels created are currently unencrypted
-
 
 ## Troubleshooting
 
