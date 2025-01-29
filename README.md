@@ -130,6 +130,8 @@ The project implements several security measures:
 
 Both client and server provide detailed logging. Check the console output for error messages and connection details.
 
+![](imgs/forge.png)
+
 
 
 
