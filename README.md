@@ -6,7 +6,9 @@ Forge is a TCP tunneling tool written in Rust that allows you to create tunnels 
 
 ## Features
 
-- **TLS Encryption**: All tunnel traffic is encrypted using modern TLS protocols
+- **Dynamic Reconfiguration**: Ability to modify tunnel endpoints (ports and IP addresses) without restarting
+- **Live Port Modification**: Change local listening ports on the fly
+- **Target Flexibility**: Dynamically update target hosts and ports for existing tunnels
 - **Secure Command Channel**: Control messages are sent over a TLS-encrypted connection
 - **Interactive Management**: Command-line interface for managing tunnels
 
