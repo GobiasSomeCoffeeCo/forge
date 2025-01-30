@@ -21,6 +21,9 @@ Forge is a TCP tunneling tool written in Rust that allows you to create tunnels 
 ## Quick Start
 
 1. Clone the repository and navigate to the project directory.
+   ```bash
+   git clone https://github.com/GobiasSomeCoffeeCo/forge.git
+   ```
 
 2. Run the setup script to generate certificates and build the project:
    ```bash
@@ -44,7 +47,7 @@ Forge is a TCP tunneling tool written in Rust that allows you to create tunnels 
 You can deploy the client to multiple machines in your network. Each client automatically generates a unique ID based on timestamp, making it easy to manage multiple connections:
 
 ```bash
-# Copy the client binary and config to multiple machines
+# Copy the client binary to multiple machines
 scp client machine1:/opt/forge/
 scp client machine2:/opt/forge/
 scp client machine3:/opt/forge/
