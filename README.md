@@ -1,6 +1,6 @@
 # Forge - TCP Tunneling Tool
 
-Forge is a TCP tunneling tool written in Rust that allows you to create tunnels between hosts with a TLS-encrypted command channel for secure tunnel management. The actual tunnel traffic is transported over direct (unsecured) TCP connections.
+Forge is a TCP tunneling tool written in Rust that allows you to create tunnels between hosts with a TLS-encrypted command channel for secure tunnel management. The actual tunnel traffic is transported over direct TCP connections.
 
 **Note:** This is an actively developed project. The current implementation includes detailed debug messages which, while verbose, are intentionally left in place to assist with development and troubleshooting during this phase.
 
