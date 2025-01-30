@@ -72,6 +72,19 @@ forge> create client-1234 3389 192.168.1.100 3389  # Access internal RDP server
 
 This allows the server to access machines that are only reachable from the client's network.
 
+```bash
+forge> create client-1234 2222 10.10.10.100 22  # Access ssh server on internal LAN
+
+[Server]               [Client]                 [LAN Machine]
+192.168.1.10    192.168.1.50/10.10.10.50       10.10.10.100
+     ^                    ^                          ^
+     |                    |                          |
+TLS :8443<-------------->:8443                      |
+                    :2222 listening                  |
+                         |                          |
+                         +------------------------->:22
+```
+
 ## Configuration
 
 ### Server Configuration
