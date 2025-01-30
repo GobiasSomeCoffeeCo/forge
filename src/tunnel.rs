@@ -1,11 +1,11 @@
 // src/tunnel.rs
-use anyhow::{anyhow, Context, Result};
-use serde::{Serialize, Deserialize};
+use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls::pki_types::{DnsName, ServerName};
@@ -38,8 +38,8 @@ enum TunnelMessage {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum TunnelDirection {
-    Forward,  // Local -> Remote (like SSH -L)
-    Reverse,  // Remote -> Local (like SSH -R)
+    Forward,
+    Reverse,
 }
 
 #[derive(Debug)]
@@ -85,17 +85,14 @@ impl MultiplexedTunnel {
 
         self.send_message(&msg).await?;
 
-        self.channels.insert(
-            channel_id,
-            Channel {
-                id: channel_id,
-                direction,
-                target_host,
-                target_port,
-                bytes_sent: 0,
-                bytes_received: 0,
-            },
-        );
+        self.channels.insert(channel_id, Channel {
+            id: channel_id,
+            direction,
+            target_host,
+            target_port,
+            bytes_sent: 0,
+            bytes_received: 0,
+        });
 
         Ok(channel_id)
     }
@@ -110,19 +107,19 @@ impl MultiplexedTunnel {
 
     pub async fn send_data(&mut self, channel_id: u32, data: &[u8]) -> Result<()> {
         let bytes_len = data.len() as u64;
-        
+
         let msg = TunnelMessage::Data {
             channel_id,
             data: data.to_vec(),
         };
-        
+
         self.send_message(&msg).await?;
-        
+
         // Update bytes sent after successful send
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             channel.bytes_sent += bytes_len;
         }
-        
+
         Ok(())
     }
 
@@ -132,7 +129,7 @@ impl MultiplexedTunnel {
         if len > MAX_MESSAGE_SIZE as u32 {
             return Err(anyhow!("Message too large"));
         }
-        
+
         self.tls_stream.write_u32_le(len).await?;
         self.tls_stream.write_all(&data).await?;
         self.tls_stream.flush().await?;
@@ -147,15 +144,19 @@ impl MultiplexedTunnel {
 
         let mut data = vec![0u8; len];
         self.tls_stream.read_exact(&mut data).await?;
-        
+
         let msg: TunnelMessage = serde_json::from_slice(&data)?;
-        
-        if let TunnelMessage::Data { channel_id, ref data } = msg {
+
+        if let TunnelMessage::Data {
+            channel_id,
+            ref data,
+        } = msg
+        {
             if let Some(channel) = self.channels.get_mut(&channel_id) {
                 channel.bytes_received += data.len() as u64;
             }
         }
-        
+
         Ok(msg)
     }
 }
@@ -178,11 +179,9 @@ impl TunnelManager {
         target_port: u16,
     ) -> Result<()> {
         let mut multiplexer = self.multiplexer.lock().await;
-        let channel_id = multiplexer.open_channel(
-            TunnelDirection::Forward,
-            target_host,
-            target_port,
-        ).await?;
+        let channel_id = multiplexer
+            .open_channel(TunnelDirection::Forward, target_host, target_port)
+            .await?;
         drop(multiplexer); // Release the lock before spawning
 
         // Start local listener
@@ -198,16 +197,14 @@ impl TunnelManager {
 
     pub async fn create_reverse_tunnel(
         &self,
-        _remote_port: u16, // Prefix with _ to silence warning
+        _remote_port: u16,
         local_host: String,
         local_port: u16,
     ) -> Result<()> {
         let mut multiplexer = self.multiplexer.lock().await;
-        multiplexer.open_channel(
-            TunnelDirection::Reverse,
-            local_host,
-            local_port,
-        ).await?;
+        multiplexer
+            .open_channel(TunnelDirection::Reverse, local_host, local_port)
+            .await?;
         Ok(())
     }
 }
@@ -224,7 +221,7 @@ async fn handle_local_listener(
     loop {
         let (socket, _) = listener.accept().await?;
         let multiplexer = multiplexer.clone();
-        
+
         tokio::spawn(async move {
             if let Err(e) = handle_local_connection(socket, channel_id, multiplexer).await {
                 eprintln!("Connection error: {}", e);
@@ -254,7 +251,6 @@ async fn handle_local_connection(
     Ok(())
 }
 
-
 // Helper functions for TLS setup
 pub async fn create_client_connection(
     addr: &str,
@@ -262,20 +258,19 @@ pub async fn create_client_connection(
     server_name: String,
 ) -> Result<Box<dyn AsyncStream>> {
     let tcp = TcpStream::connect(addr).await?;
-    
+
     let server_name = if let Ok(ip) = IpAddr::from_str(&server_name) {
         ServerName::IpAddress(ip.into())
     } else {
         // Convert to static string and then get a reference to it
         let static_name = Box::leak(server_name.clone().into_boxed_str());
-        let dns_name = DnsName::try_from(&*static_name)
-            .map_err(|_| anyhow!("Invalid DNS name"))?;
+        let dns_name = DnsName::try_from(&*static_name).map_err(|_| anyhow!("Invalid DNS name"))?;
         ServerName::DnsName(dns_name)
     };
 
     let connector = TlsConnector::from(config);
     let tls_stream = connector.connect(server_name, tcp).await?;
-    
+
     Ok(Box::new(tls_stream))
 }
 

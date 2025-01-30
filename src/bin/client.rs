@@ -4,11 +4,10 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use forge::protocol::{Command, Response, TunnelDirection, TunnelInfo};
 use rustls_pemfile::certs;
-use toml::Value;
 use std::collections::HashMap;
-use std::fs;
+use std::env;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,18 +99,21 @@ async fn create_tls_connection(
 
 async fn start_tunnel_listener(local_port: u16, tunnel_manager: Arc<TunnelManager>) -> Result<()> {
     let local_addr = format!("0.0.0.0:{}", local_port);
-    
+
     let listener = loop {
         match TcpListener::bind(&local_addr).await {
             Ok(l) => {
                 println!("Successfully bound to {}", local_addr);
                 break l;
-            },
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                println!("Port {} still in use, waiting 100ms before retry...", local_port);
+                println!(
+                    "Port {} still in use, waiting 100ms before retry...",
+                    local_port
+                );
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 continue;
-            },
+            }
             Err(e) => return Err(anyhow!("Failed to bind to {}: {}", local_addr, e)),
         }
     };
@@ -238,12 +240,12 @@ async fn handle_server_commands(
 
     loop {
         buf.clear();
-        
+
         let n = match reader.read_line(&mut buf).await {
             Ok(n) => {
                 println!("Read {} bytes from command channel", n);
                 n
-            },
+            }
             Err(e) => {
                 eprintln!("Error reading from command channel: {}", e);
                 return Err(anyhow!("Command channel read error: {}", e));
@@ -268,7 +270,7 @@ async fn handle_server_commands(
             Ok(cmd) => {
                 println!("Parsed command successfully: {:?}", cmd);
                 cmd
-            },
+            }
             Err(e) => {
                 eprintln!("Failed to parse message as command: {}", e);
                 continue;
@@ -276,7 +278,12 @@ async fn handle_server_commands(
         };
 
         match cmd {
-            Command::ModifyTunnel { old_local_port, new_local_port, new_target_host, new_target_port } => {
+            Command::ModifyTunnel {
+                old_local_port,
+                new_local_port,
+                new_target_host,
+                new_target_port,
+            } => {
                 println!(
                     "Processing modify tunnel command: {} -> {} ({} -> {})",
                     old_local_port, new_local_port, new_target_host, new_target_port
@@ -301,8 +308,13 @@ async fn handle_server_commands(
                 });
 
                 send_response(&mut writer, &Response::Ok).await?;
-            },
-            Command::CreateTunnel { local_port, target_host, target_port, direction: _ } => {
+            }
+            Command::CreateTunnel {
+                local_port,
+                target_host,
+                target_port,
+                direction: _,
+            } => {
                 if let Err(e) = tunnel_manager.modify_tunnel(
                     local_port,
                     local_port,
@@ -321,11 +333,13 @@ async fn handle_server_commands(
                 });
 
                 send_response(&mut writer, &Response::Ok).await?;
-            },
+            }
             Command::CloseTunnel { local_port } => {
                 let send_result = {
                     let tunnels = tunnel_manager.tunnels.lock().unwrap();
-                    tunnels.get(&local_port).map(|config| config.shutdown.send(()))
+                    tunnels
+                        .get(&local_port)
+                        .map(|config| config.shutdown.send(()))
                 };
 
                 match send_result {
@@ -333,11 +347,12 @@ async fn handle_server_commands(
                     None => {
                         send_response(
                             &mut writer,
-                            &Response::Error(format!("No tunnel found on port {}", local_port))
-                        ).await?;
+                            &Response::Error(format!("No tunnel found on port {}", local_port)),
+                        )
+                        .await?;
                     }
                 }
-            },
+            }
             Command::ListTunnels => {
                 let tunnel_list = {
                     let tunnels = tunnel_manager.tunnels.lock().unwrap();
@@ -355,7 +370,7 @@ async fn handle_server_commands(
                 };
 
                 send_response(&mut writer, &Response::TunnelList(tunnel_list)).await?;
-            },
+            }
             Command::Register { client_id } => {
                 println!("Registered as client {}", client_id);
                 send_response(&mut writer, &Response::Ok).await?;
@@ -395,16 +410,22 @@ async fn main() -> Result<()> {
         ServerName::IpAddress(ip.into())
     } else {
         let dns_name = DnsName::try_from(server_sni).map_err(|_| {
-            anyhow!("Invalid server name (neither IP address nor valid DNS name): {}", server_sni)
+            anyhow!(
+                "Invalid server name (neither IP address nor valid DNS name): {}",
+                server_sni
+            )
         })?;
         ServerName::DnsName(dns_name)
     };
 
     // Initialize tunnel manager
     let tunnel_manager = Arc::new(TunnelManager::new());
-    
+
     // Set up command channel connection
-    println!("Establishing command channel connection to {}...", server_address);
+    println!(
+        "Establishing command channel connection to {}...",
+        server_address
+    );
     let cmd_tcp = TcpStream::connect(&server_address)
         .await
         .context("Failed to establish command TCP connection")?;
@@ -415,9 +436,21 @@ async fn main() -> Result<()> {
     let mut cmd_reader = BufReader::new(cmd_rd);
     let mut cmd_writer = BufWriter::new(cmd_wr);
 
+    let binary_name = env::args()
+        .next()
+        .map(|p| {
+            Path::new(&p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("client")
+                .to_string()
+        })
+        .unwrap_or("client".to_string());
+
     // Generate a unique client ID
     let client_id = format!(
-        "client-{}",
+        "{}-{}",
+        binary_name,
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -433,7 +466,7 @@ async fn main() -> Result<()> {
 
     // Main command handling loop using command handler
     let cmd_tunnel_manager = tunnel_manager.clone();
-    
+
     // Use a separate scope for the command handler
     {
         let command_handler = handle_server_commands(cmd_reader, cmd_writer, cmd_tunnel_manager);

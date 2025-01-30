@@ -16,16 +16,16 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 #[derive(Parser)]
 struct ServerArgs {
-    /// Address to listen on, e.g. "127.0.0.1:8443"
-    #[arg(long, default_value = "127.0.0.1:8443")]
+    /// Address to listen on, e.g. "0.0.0.0:8443"
+    #[arg(long, default_value = "0.0.0.0:8443")]
     addr: String,
 
     /// Path to server private key (PKCS8 PEM)
-    #[arg(long)]
+    #[arg(long, default_value = "keys/server-key.pem")]
     key: PathBuf,
 
     /// Path to server certificate (PEM)
-    #[arg(long)]
+    #[arg(long, default_value = "keys/server-cert.pem")]
     cert: PathBuf,
 
     /// Allow UDP tunnels (default is TCP only)
@@ -44,7 +44,7 @@ struct ConnectedClient {
 }
 
 impl ConnectedClient {
-    fn new(
+    fn _new(
         writer: BufWriter<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>,
     ) -> Self {
         Self {
@@ -152,7 +152,7 @@ async fn handle_client(
     tcp_stream: TcpStream,
     acceptor: TlsAcceptor,
     state: Arc<Mutex<ServerState>>,
-    allow_udp: bool,
+    _allow_udp: bool,
     min_port: u16,
     max_port: u16,
 ) -> Result<()> {
@@ -188,7 +188,7 @@ async fn handle_client(
 
         // Try to parse message as a Command first
         let parsed_command = serde_json::from_str::<Command>(&buf.trim());
-        
+
         // Handle the message based on whether it's a command or not
         match parsed_command {
             Ok(cmd) => {
@@ -225,7 +225,8 @@ async fn handle_client(
                                             "Port {} outside allowed range {}-{}",
                                             local_port, min_port, max_port
                                         )),
-                                    ).await?;
+                                    )
+                                    .await?;
                                     continue;
                                 }
 
@@ -254,12 +255,13 @@ async fn handle_client(
                             let state = state.lock().await;
                             if let Some(client) = state.clients.get(id) {
                                 let mut tunnels = client.tunnels.lock().await;
-                                
+
                                 // Remove old tunnel while preserving stats if they exist
-                                let old_stats = tunnels.remove(&old_local_port)
+                                let old_stats = tunnels
+                                    .remove(&old_local_port)
                                     .map(|t| (t.bytes_sent, t.bytes_received))
                                     .unwrap_or((0, 0));
-        
+
                                 // Create new tunnel info with preserved stats
                                 let new_tunnel = TunnelInfo {
                                     local_port: new_local_port,
@@ -269,16 +271,20 @@ async fn handle_client(
                                     bytes_sent: old_stats.0,
                                     bytes_received: old_stats.1,
                                 };
-        
+
                                 // Insert new tunnel info
                                 tunnels.insert(new_local_port, new_tunnel);
-        
+
                                 let mut writer = client.writer.lock().await;
                                 send_response(&mut *writer, &Response::Ok).await?;
-                                
+
                                 println!(
                                     "Updated tunnel mapping for client {}: {}:{} -> {}:{}",
-                                    id, "localhost", new_local_port, new_target_host, new_target_port
+                                    id,
+                                    "localhost",
+                                    new_local_port,
+                                    new_target_host,
+                                    new_target_port
                                 );
                             }
                         }
@@ -300,10 +306,12 @@ async fn handle_client(
                             let state = state.lock().await;
                             if let Some(client) = state.clients.get(id) {
                                 let tunnels = client.tunnels.lock().await;
-                                let tunnel_list: Vec<TunnelInfo> = tunnels.values().cloned().collect();
+                                let tunnel_list: Vec<TunnelInfo> =
+                                    tunnels.values().cloned().collect();
 
                                 let mut writer = client.writer.lock().await;
-                                send_response(&mut *writer, &Response::TunnelList(tunnel_list)).await?;
+                                send_response(&mut *writer, &Response::TunnelList(tunnel_list))
+                                    .await?;
                             }
                         }
                     }
