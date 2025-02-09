@@ -81,8 +81,8 @@ forge> create client-1234 2222 10.10.10.100 22  # Access ssh server on internal 
      |                    |                          |
 TLS :8443<-------------->:8443                       |
                     :2222 listening                  |
-                         |                           |
-                         +------------------------->:22
+                          |                          |
+                          +------------------------>:22
 ```
 
 ## Configuration

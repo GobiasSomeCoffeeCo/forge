@@ -1,6 +1,6 @@
 include!(concat!(env!("OUT_DIR"), "/config.rs"));
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use forge::protocol::{Command, Response, TunnelDirection, TunnelInfo};
 use rustls_pemfile::certs;
@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, DnsName, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 
 #[derive(Parser)]
 struct ClientArgs {
@@ -32,6 +32,7 @@ struct ClientArgs {
     sni: String,
 }
 
+#[allow(dead_code)]
 struct TunnelConfig {
     local_port: u16,
     target_host: String,

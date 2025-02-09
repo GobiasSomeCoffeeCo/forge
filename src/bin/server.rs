@@ -1,5 +1,5 @@
 // src/bin/server.rs
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use forge::protocol::{Command, Response, TunnelDirection, TunnelInfo};
 use rustls_pemfile::{certs, pkcs8_private_keys};
@@ -10,9 +10,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser)]
 struct ServerArgs {
@@ -231,14 +231,17 @@ async fn handle_client(
                                 }
 
                                 let mut tunnels = client.tunnels.lock().await;
-                                tunnels.insert(local_port, TunnelInfo {
+                                tunnels.insert(
                                     local_port,
-                                    target_host,
-                                    target_port,
-                                    direction,
-                                    bytes_sent: 0,
-                                    bytes_received: 0,
-                                });
+                                    TunnelInfo {
+                                        local_port,
+                                        target_host,
+                                        target_port,
+                                        direction,
+                                        bytes_sent: 0,
+                                        bytes_received: 0,
+                                    },
+                                );
 
                                 let mut writer = client.writer.lock().await;
                                 send_response(&mut *writer, &Response::Ok).await?;

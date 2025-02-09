@@ -5,3 +5,6 @@ client
 keys
 server
 sslkeygen.sh
+bak.Cross.toml
+help
+/.cargo

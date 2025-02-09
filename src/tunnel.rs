@@ -1,5 +1,5 @@
 // src/tunnel.rs
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -42,6 +42,7 @@ pub enum TunnelDirection {
     Reverse,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Channel {
     id: u32,
@@ -85,14 +86,17 @@ impl MultiplexedTunnel {
 
         self.send_message(&msg).await?;
 
-        self.channels.insert(channel_id, Channel {
-            id: channel_id,
-            direction,
-            target_host,
-            target_port,
-            bytes_sent: 0,
-            bytes_received: 0,
-        });
+        self.channels.insert(
+            channel_id,
+            Channel {
+                id: channel_id,
+                direction,
+                target_host,
+                target_port,
+                bytes_sent: 0,
+                bytes_received: 0,
+            },
+        );
 
         Ok(channel_id)
     }
@@ -136,6 +140,7 @@ impl MultiplexedTunnel {
         Ok(())
     }
 
+    #[allow(private_interfaces)]
     pub async fn receive_message(&mut self) -> Result<TunnelMessage> {
         let len = self.tls_stream.read_u32_le().await? as usize;
         if len > MAX_MESSAGE_SIZE {

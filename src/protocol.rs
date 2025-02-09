@@ -20,10 +20,10 @@ pub enum Command {
         direction: TunnelDirection,
     },
     ModifyTunnel {
-        old_local_port: u16,     // Current local port
-        new_local_port: u16,     // New local port to listen on
-        new_target_host: String, // New target IP/hostname
-        new_target_port: u16,    // New target port
+        old_local_port: u16,    
+        new_local_port: u16,    
+        new_target_host: String,
+        new_target_port: u16,   
     },
     CloseTunnel {
         local_port: u16,
