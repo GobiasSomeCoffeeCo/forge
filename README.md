@@ -1,6 +1,6 @@
 # Forge - Network Tunneling & SOCKS Proxy Tool
 
-Forge is a powerful network tunneling tool written in Rust that provides secure TCP tunneling and SOCKS5 proxy capabilities with TLS-encrypted command channels. Deploy clients on remote networks and route traffic through them from your local machine.
+Forge is a powerful network tunneling tool written in Rust that provides secure TCP and UDP tunneling with SOCKS5 proxy capabilities and TLS-encrypted command channels. Deploy clients on remote networks and route traffic through them from your local machine.
 
 ## Features
 
@@ -31,6 +31,7 @@ Forge is a powerful network tunneling tool written in Rust that provides secure 
 ### 1. Setup and Build
 
 **First-time setup (certificates + configuration + build):**
+
 ```bash
 git clone <repository>
 cd forge
@@ -41,6 +42,7 @@ cd forge
 ```
 
 **Cross-compile for multiple architectures:**
+
 ```bash
 # Install targets first
 rustup target add aarch64-unknown-linux-gnu mipsel-unknown-linux-musl armv7-unknown-linux-gnueabihf
@@ -50,6 +52,7 @@ rustup target add aarch64-unknown-linux-gnu mipsel-unknown-linux-musl armv7-unkn
 ```
 
 **Manual build (current architecture only):**
+
 ```bash
 cargo build --release
 ```
@@ -115,6 +118,7 @@ cargo build --release --bin client --target aarch64-unknown-linux-gnu
 ```
 
 **Supported Architectures:**
+
 - x86_64-unknown-linux-gnu (Intel/AMD 64-bit)
 - aarch64-unknown-linux-gnu (ARM 64-bit - Pi 4, modern routers)
 - aarch64-unknown-linux-musl (ARM 64-bit static)
@@ -143,6 +147,7 @@ forge> exit                              # Shutdown server
 ## Use Cases
 
 ### Network Reconnaissance
+
 ```bash
 # Deploy client on DMZ machine, scan internal network
 forge> socks dmz-client start 1080 30
@@ -150,6 +155,7 @@ nmap --proxies socks4://dmz-ip:1080 10.0.0.0/24 --open
 ```
 
 ### Access Internal Services
+
 ```bash
 # TCP tunnel for web services
 forge> create client1 8080 192.168.1.1 80 tcp
@@ -165,12 +171,14 @@ curl --socks5 edge-ip:1080 http://192.168.1.1/
 ```
 
 ### SSH Through Proxy
+
 ```bash
 # SSH to machine only reachable through client
 ssh -o ProxyCommand="nc -X 5 -x client-ip:1080 %h %p" user@internal-host
 ```
 
 ### Multi-Hop Networking
+
 ```bash
 # Chain through multiple networks
 Client A (Network 1) -> Client B (Network 2) -> Target (Network 3)
@@ -191,6 +199,7 @@ ca_cert = "ca-cert.pem"  # Certificate is embedded in binary
 After running `./build-forge.sh` or `cargo build`, the client binary contains all necessary configuration and certificates.
 
 ### Server Arguments
+
 - `--addr`: Listen address (default: 0.0.0.0:8443)
 - `--cert`: Server certificate path
 - `--key`: Server private key path
@@ -216,17 +225,20 @@ Port scanning functionality has been removed to prevent triggering network secur
 ## Troubleshooting
 
 ### Certificate Issues
+
 ```bash
 # Regenerate certificates
 ./build-forge.sh
 ```
 
 ### Network Issues
+
 - Check firewall rules on both server and client
 - Verify TLS connectivity: `openssl s_client -connect server:8443`
 - Ensure client can reach server on port 8443
 
 ### SOCKS Proxy Issues
+
 - Test connectivity: `curl --socks5 client-ip:1080 http://httpbin.org/ip`
 - For nmap, use: `nmap --proxies socks4://client-ip:1080 target --open`
 - For broader compatibility, use: `proxychains4 nmap target --open`
@@ -236,6 +248,7 @@ Port scanning functionality has been removed to prevent triggering network secur
 ## Development
 
 ### Project Structure
+
 - `src/bin/server.rs` - Server with integrated SOCKS management
 - `src/bin/client.rs` - Unified client with SOCKS capability  
 - `src/socks.rs` - SOCKS5 proxy implementation
@@ -245,6 +258,7 @@ Port scanning functionality has been removed to prevent triggering network secur
 ### Build Scripts
 
 **`./build-forge.sh`** - Complete first-time setup:
+
 - Prompts for server IP address
 - Generates TLS certificates (CA, server cert/key)
 - Updates `config.toml` with your server IP
@@ -252,15 +266,18 @@ Port scanning functionality has been removed to prevent triggering network secur
 - Copies binaries and certificates to current directory
 
 **`./build-all.sh`** - Cross-compilation for deployment:
+
 - Builds client binary for multiple architectures
 - Creates `target/client-{architecture}` files
 - Requires targets to be installed first with `rustup target add`
 
 **`cargo build --release`** - Standard Rust build:
+
 - Builds server and client for current architecture only
 - Outputs to `target/release/`
 
 ### Building from Source
+
 ```bash
 # First time setup
 ./build-forge.sh
@@ -273,3 +290,4 @@ cargo build --release --bin server --bin client
 ```
 
 Clean, minimal codebase focused on core tunneling and SOCKS functionality.
+
