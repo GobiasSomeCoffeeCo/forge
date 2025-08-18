@@ -1,0 +1,50 @@
+  New Functionality:
+
+  - UDP tunnel creation: create client123 6969 192.168.1.1 69 udp
+  - Server CLI supports protocol selection: [tcp|udp] parameter
+  - Client UDP tunnel listener: Handles UDP packet forwarding
+  - Bidirectional UDP support: Forwards packets and returns responses
+
+  Implementation Details:
+
+  Server Commands:
+  - create <client_id> <local_port> <target_host> <target_port> tcp - TCP tunnel
+  - create <client_id> <local_port> <target_host> <target_port> udp - UDP tunnel
+  - create <client_id> <local_port> <target_host> <target_port> udp -r - Reverse UDP
+  tunnel
+
+  Client Implementation:
+  - start_tcp_tunnel_listener() - Handles TCP connections
+  - start_udp_tunnel_listener() - Handles UDP packet forwarding
+  - Automatic protocol detection and appropriate listener startup
+
+  UDP Packet Handling:
+  - Receives UDP packets on local port
+  - Forwards to target host:port
+  - Listens for responses with timeout
+  - Returns responses to original sender
+
+  Usage Examples:
+
+  # DNS tunnel through remote client
+  forge> create client1 5353 8.8.8.8 53 udp
+  dig @localhost -p 5353 google.com
+
+  # NTP tunnel
+  forge> create client1 1123 pool.ntp.org 123 udp
+  ntpdate localhost -p 1123
+
+  # DHCP relay (if needed)
+  forge> create client1 6767 192.168.1.1 67 udp
+
+  Updated commit message:
+
+  Add integrated SOCKS5 proxy and full UDP tunnel support
+
+  Major Features:
+  - ✅ Integrate SOCKS5 proxy into server and client binaries
+  - ✅ Add complete UDP tunnel support alongside TCP tunnels
+  - ✅ Add enhanced CLI with readline support (history, navigation, arrows)
+  - ✅ Cross-platform compilation support for multiple architectures
+  - ✅ Unified client binary with embedded configuration and certificates
+

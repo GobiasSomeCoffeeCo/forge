@@ -9,6 +9,7 @@ anyhow = "1.0"
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+rustyline = "14.0"
 tokio = { version = "1.36", features = [
     "rt-multi-thread",
     "net",              
@@ -22,6 +23,8 @@ tokio = { version = "1.36", features = [
 tokio-rustls = { version = "0.25", features = ["tls12", "ring"], default-features = false }
 rustls-pemfile = "1.0"
 toml = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+colored = "2.0"
 
 [build-dependencies]
 toml = "0.7"
@@ -36,9 +39,8 @@ debug = false
 incremental = false
 overflow-checks = false
 rpath = false
-link-args = "-s" 
 debug-assertions = false
-backtrace = false
+
 
 [profile.release.package."*"]
 opt-level = "z"
@@ -47,3 +49,7 @@ codegen-units = 1
 [[bin]]
 name = "client"
 path = "src/bin/client.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"

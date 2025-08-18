@@ -6,13 +6,14 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_rustls::rustls::pki_types::{DnsName, ServerName};
 use tokio_rustls::rustls::{ClientConfig, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-const MAX_MESSAGE_SIZE: usize = 16384; // 16KB max message size
+const MAX_MESSAGE_SIZE: usize = 65536; // 64KB max message size for better performance
+const BUFFER_SIZE: usize = 32768; // 32KB buffer for optimal throughput
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
@@ -182,6 +183,7 @@ impl TunnelManager {
         local_port: u16,
         target_host: String,
         target_port: u16,
+        protocol: &crate::protocol::TunnelProtocol,
     ) -> Result<()> {
         let mut multiplexer = self.multiplexer.lock().await;
         let channel_id = multiplexer
@@ -189,13 +191,27 @@ impl TunnelManager {
             .await?;
         drop(multiplexer); // Release the lock before spawning
 
-        // Start local listener
+        // Start local listener based on protocol
         let multiplexer_clone = self.multiplexer.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_local_listener(local_port, channel_id, multiplexer_clone).await {
-                eprintln!("Forward tunnel error: {}", e);
+        match protocol {
+            crate::protocol::TunnelProtocol::Tcp => {
+                tokio::spawn(async move {
+                    if let Err(e) = handle_local_tcp_listener(local_port, channel_id, multiplexer_clone).await {
+                        eprintln!("Forward TCP tunnel error: {}", e);
+                    }
+                });
             }
-        });
+            crate::protocol::TunnelProtocol::Udp => {
+                tokio::spawn(async move {
+                    if let Err(e) = handle_local_udp_listener(local_port, channel_id, multiplexer_clone).await {
+                        eprintln!("Forward UDP tunnel error: {}", e);
+                    }
+                });
+            }
+            crate::protocol::TunnelProtocol::Socks5 => {
+                return Err(anyhow!("SOCKS5 protocol should use separate SOCKS proxy functionality"));
+            }
+        }
 
         Ok(())
     }
@@ -205,6 +221,7 @@ impl TunnelManager {
         _remote_port: u16,
         local_host: String,
         local_port: u16,
+        _protocol: &crate::protocol::TunnelProtocol,
     ) -> Result<()> {
         let mut multiplexer = self.multiplexer.lock().await;
         multiplexer
@@ -214,7 +231,7 @@ impl TunnelManager {
     }
 }
 
-async fn handle_local_listener(
+async fn handle_local_tcp_listener(
     local_port: u16,
     channel_id: u32,
     multiplexer: Arc<Mutex<MultiplexedTunnel>>,
@@ -228,20 +245,45 @@ async fn handle_local_listener(
         let multiplexer = multiplexer.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_local_connection(socket, channel_id, multiplexer).await {
-                eprintln!("Connection error: {}", e);
+            if let Err(e) = handle_local_tcp_connection(socket, channel_id, multiplexer).await {
+                eprintln!("TCP connection error: {}", e);
             }
         });
     }
 }
 
-async fn handle_local_connection(
+async fn handle_local_udp_listener(
+    local_port: u16,
+    channel_id: u32,
+    multiplexer: Arc<Mutex<MultiplexedTunnel>>,
+) -> Result<()> {
+    let socket = UdpSocket::bind(format!("127.0.0.1:{}", local_port)).await?;
+    let mut buf = vec![0u8; BUFFER_SIZE];
+
+    loop {
+        let (n, peer_addr) = socket.recv_from(&mut buf).await?;
+        
+        // For UDP, we need to include the peer address in the data
+        // so the remote side knows where to send the response
+        let mut udp_packet = Vec::new();
+        udp_packet.extend_from_slice(&peer_addr.to_string().as_bytes());
+        udp_packet.push(b'\0'); // Null terminator
+        udp_packet.extend_from_slice(&buf[..n]);
+
+        let mut multiplexer = multiplexer.lock().await;
+        if let Err(e) = multiplexer.send_data(channel_id, &udp_packet).await {
+            eprintln!("UDP send error: {}", e);
+        }
+    }
+}
+
+async fn handle_local_tcp_connection(
     mut socket: TcpStream,
     channel_id: u32,
     multiplexer: Arc<Mutex<MultiplexedTunnel>>,
 ) -> Result<()> {
     let (mut socket_rd, _) = socket.split();
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; BUFFER_SIZE];
 
     loop {
         let n = socket_rd.read(&mut buf).await?;

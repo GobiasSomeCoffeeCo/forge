@@ -2,11 +2,14 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use forge::protocol::{Command, Response, TunnelDirection, TunnelInfo};
+use forge::socks::{SocksConfig, SocksProxy};
 use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustyline::DefaultEditor;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -28,9 +31,9 @@ struct ServerArgs {
     #[arg(long, default_value = "keys/server-cert.pem")]
     cert: PathBuf,
 
-    /// Allow UDP tunnels (default is TCP only)
+    /// Disable UDP tunnels (UDP enabled by default)
     #[arg(long)]
-    allow_udp: bool,
+    disable_udp: bool,
 
     /// Port range allowed for tunnels (e.g. "1024-65535")
     #[arg(long, default_value = "1024-65535")]
@@ -41,6 +44,7 @@ struct ServerArgs {
 struct ConnectedClient {
     writer: Arc<Mutex<BufWriter<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>>>,
     tunnels: Arc<Mutex<HashMap<u16, TunnelInfo>>>,
+    socks_proxy: Arc<Mutex<Option<SocksProxy>>>,
 }
 
 impl ConnectedClient {
@@ -50,6 +54,7 @@ impl ConnectedClient {
         Self {
             writer: Arc::new(Mutex::new(writer)),
             tunnels: Arc::new(Mutex::new(HashMap::new())),
+            socks_proxy: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -134,7 +139,7 @@ async fn main() -> Result<()> {
 
         let acceptor = acceptor.clone();
         let state = state.clone();
-        let allow_udp = args.allow_udp;
+        let allow_udp = !args.disable_udp;
         let min_port = min_port;
         let max_port = max_port;
 
@@ -200,6 +205,7 @@ async fn handle_client(
                         let client = Arc::new(ConnectedClient {
                             writer: writer.clone(),
                             tunnels: Arc::new(Mutex::new(HashMap::new())),
+                            socks_proxy: Arc::new(Mutex::new(None)),
                         });
                         state.clients.insert(id.clone(), client.clone());
                         client_id = Some(id.clone());
@@ -213,6 +219,7 @@ async fn handle_client(
                         target_host,
                         target_port,
                         direction,
+                        protocol,
                     } => {
                         if let Some(ref id) = client_id {
                             let state = state.lock().await;
@@ -227,7 +234,7 @@ async fn handle_client(
                                         )),
                                     )
                                     .await?;
-                                    continue;
+                                    return Err(anyhow!("Invalid command"));
                                 }
 
                                 let mut tunnels = client.tunnels.lock().await;
@@ -238,8 +245,11 @@ async fn handle_client(
                                         target_host,
                                         target_port,
                                         direction,
+                                        protocol,
                                         bytes_sent: 0,
                                         bytes_received: 0,
+                                        connections_active: 0,
+                                        connections_total: 0,
                                     },
                                 );
 
@@ -271,8 +281,11 @@ async fn handle_client(
                                     target_host: new_target_host.clone(),
                                     target_port: new_target_port,
                                     direction: TunnelDirection::Forward,
+                                    protocol: forge::protocol::TunnelProtocol::Tcp,
                                     bytes_sent: old_stats.0,
                                     bytes_received: old_stats.1,
+                                    connections_active: 0,
+                                    connections_total: 0,
                                 };
 
                                 // Insert new tunnel info
@@ -318,6 +331,81 @@ async fn handle_client(
                             }
                         }
                     }
+                    Command::StartSocksProxy { bind_port, timeout } => {
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                let mut socks_proxy_guard = client.socks_proxy.lock().await;
+                                
+                                if socks_proxy_guard.is_some() {
+                                    let mut writer = client.writer.lock().await;
+                                    send_response(&mut *writer, &Response::Error("SOCKS proxy already running".to_string())).await?;
+                                } else {
+                                    let config = SocksConfig {
+                                        bind_addr: format!("0.0.0.0:{}", bind_port).parse().unwrap(),
+                                        timeout: Duration::from_secs(timeout),
+                                        enable_udp: true,
+                                    };
+                                    
+                                    let mut proxy = SocksProxy::new(config);
+                                    
+                                    // Start the proxy in a background task
+                                    let proxy_handle = tokio::spawn(async move {
+                                        if let Err(e) = proxy.start().await {
+                                            eprintln!("SOCKS proxy error: {}", e);
+                                        }
+                                    });
+                                    
+                                    // Store a new proxy instance for tracking
+                                    let tracking_proxy = SocksProxy::new(SocksConfig {
+                                        bind_addr: format!("0.0.0.0:{}", bind_port).parse().unwrap(),
+                                        timeout: Duration::from_secs(timeout),
+                                        enable_udp: true,
+                                    });
+                                    
+                                    *socks_proxy_guard = Some(tracking_proxy);
+                                    
+                                    let mut writer = client.writer.lock().await;
+                                    send_response(&mut *writer, &Response::Ok).await?;
+                                    
+                                    println!("SOCKS proxy started on port {} for client {}", bind_port, id);
+                                    
+                                    // Don't await the handle - let it run in background
+                                    std::mem::forget(proxy_handle);
+                                }
+                            }
+                        }
+                    }
+                    Command::StopSocksProxy => {
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                let mut socks_proxy_guard = client.socks_proxy.lock().await;
+                                
+                                if socks_proxy_guard.is_none() {
+                                    let mut writer = client.writer.lock().await;
+                                    send_response(&mut *writer, &Response::Error("No SOCKS proxy running".to_string())).await?;
+                                } else {
+                                    *socks_proxy_guard = None;
+                                    
+                                    let mut writer = client.writer.lock().await;
+                                    send_response(&mut *writer, &Response::Ok).await?;
+                                    
+                                    println!("SOCKS proxy stopped for client {}", id);
+                                }
+                            }
+                        }
+                    }
+                    Command::ScanPorts { .. } => {
+                        // TODO: Implement port scanning
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                let mut writer = client.writer.lock().await;
+                                send_response(&mut *writer, &Response::Error("Not implemented".to_string())).await?;
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -326,12 +414,12 @@ async fn handle_client(
                     Ok(response) => {
                         println!("Received response from client: {:?}", response);
                         // Handle client response if needed
-                        continue;
+                        return Err(anyhow!("Invalid command"));
                     }
                     Err(_) => {
                         // If it's neither a command nor a response, it's an error
                         eprintln!("Invalid message format: {}", e);
-                        continue;
+                        return Err(anyhow!("Invalid command"));
                     }
                 }
             }
@@ -340,37 +428,70 @@ async fn handle_client(
 }
 
 async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
-    let mut stdin = BufReader::new(tokio::io::stdin());
-    let mut buf = String::new();
-
-    println!("Server command interface ready. Type 'help' for commands.");
-
-    loop {
-        buf.clear();
-        print!("forge> ");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-
-        if stdin.read_line(&mut buf).await.unwrap() == 0 {
-            break;
-        }
-
-        let parts: Vec<&str> = buf.trim().split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        match parts[0] {
-            "help" => {
-                println!("Available commands:");
-                println!("  clients                     - List connected clients");
-                println!("  tunnels <client_id>         - List tunnels for a client");
-                println!(
-                    "  create <client_id> <local_port> <target_host> <target_port> [-r] - Create tunnel"
-                );
-                println!("  modify <client_id> <local_port> <new_host> <new_port> - Modify tunnel");
-                println!("  close <client_id> <local_port> - Close tunnel");
-                println!("  exit                        - Shut down server");
+    // Spawn blocking task for readline
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        let mut rl = DefaultEditor::new().expect("Failed to create readline editor");
+        
+        println!("Server command interface ready. Type 'help' for commands.");
+        
+        loop {
+            match rl.readline("forge> ") {
+                Ok(line) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    
+                    let _ = rl.add_history_entry(&line);
+                    
+                    let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    
+                    // Run the command handling in async context
+                    rt.block_on(async {
+                        handle_command_parts(&parts, &state).await;
+                    });
+                }
+                Err(rustyline::error::ReadlineError::Interrupted) => {
+                    println!("Use 'exit' to quit");
+                    continue;
+                }
+                Err(rustyline::error::ReadlineError::Eof) => {
+                    println!("Exiting...");
+                    break;
+                }
+                Err(err) => {
+                    println!("Error: {}", err);
+                    break;
+                }
             }
+        }
+    }).await.expect("Readline task failed");
+}
+
+async fn handle_command_parts(parts: &[&str], state: &Arc<Mutex<ServerState>>) {
+    if let Err(e) = try_handle_command_parts(parts, state).await {
+        println!("Command error: {}", e);
+    }
+}
+
+async fn try_handle_command_parts(parts: &[&str], state: &Arc<Mutex<ServerState>>) -> Result<()> {
+    match parts[0] {
+        "help" => {
+            println!("Available commands:");
+            println!("  clients                     - List connected clients");
+            println!("  tunnels <client_id>         - List tunnels for a client");
+            println!(
+                "  create <client_id> <local_port> <target_host> <target_port> [tcp|udp] [-r] - Create tunnel"
+            );
+            println!("  modify <client_id> <local_port> <new_host> <new_port> - Modify tunnel");
+            println!("  close <client_id> <local_port> - Close tunnel");
+            println!("  socks <client_id> start <port> [timeout] - Start SOCKS proxy");
+            println!("  socks <client_id> stop      - Stop SOCKS proxy");
+            println!("  exit                        - Shut down server");
+        }
             "clients" => {
                 let state = state.lock().await;
                 println!("Connected clients:");
@@ -381,7 +502,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
             "tunnels" => {
                 if parts.len() != 2 {
                     println!("Usage: tunnels <client_id>");
-                    continue;
+                    return Err(anyhow!("Invalid command"));
                 }
 
                 let state = state.lock().await;
@@ -405,9 +526,9 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
             "create" => {
                 if parts.len() < 5 {
                     println!(
-                        "Usage: create <client_id> <local_port> <target_host> <target_port> [-r]"
+                        "Usage: create <client_id> <local_port> <target_host> <target_port> [tcp|udp] [-r]"
                     );
-                    continue;
+                    return Err(anyhow!("Invalid command"));
                 }
 
                 let client_id = parts[1];
@@ -415,7 +536,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                     Ok(port) => port,
                     Err(_) => {
                         println!("Invalid local port number");
-                        continue;
+                        return Err(anyhow!("Invalid command"));
                     }
                 };
                 let target_host = parts[3].to_string();
@@ -423,14 +544,25 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                     Ok(port) => port,
                     Err(_) => {
                         println!("Invalid target port number");
-                        continue;
+                        return Err(anyhow!("Invalid command"));
                     }
                 };
-                let direction = if parts.get(5) == Some(&"-r") {
-                    TunnelDirection::Reverse
-                } else {
-                    TunnelDirection::Forward
-                };
+                // Parse protocol (tcp/udp) and direction
+                let mut protocol = forge::protocol::TunnelProtocol::Tcp;
+                let mut direction = TunnelDirection::Forward;
+                
+                // Check remaining arguments for protocol and direction
+                for &arg in &parts[5..] {
+                    match arg {
+                        "tcp" => protocol = forge::protocol::TunnelProtocol::Tcp,
+                        "udp" => protocol = forge::protocol::TunnelProtocol::Udp,
+                        "-r" => direction = TunnelDirection::Reverse,
+                        _ => {
+                            println!("Unknown argument: {}. Use 'tcp', 'udp', or '-r'", arg);
+                            return Err(anyhow!("Invalid command"));
+                        }
+                    }
+                }
 
                 let state = state.lock().await;
                 if let Some(client) = state.clients.get(client_id) {
@@ -439,6 +571,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                         target_host,
                         target_port,
                         direction,
+                        protocol,
                     };
                     if let Err(e) = client.send_command(&cmd).await {
                         println!("Failed to send command: {}", e);
@@ -452,7 +585,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
             "modify" => {
                 if parts.len() != 5 {
                     println!("Usage: modify <client_id> <local_port> <new_host> <new_port>");
-                    continue;
+                    return Err(anyhow!("Invalid command"));
                 }
 
                 let client_id = parts[1];
@@ -460,7 +593,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                     Ok(port) => port,
                     Err(_) => {
                         println!("Invalid local port number");
-                        continue;
+                        return Err(anyhow!("Invalid command"));
                     }
                 };
                 let new_target_host = parts[3].to_string();
@@ -468,7 +601,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                     Ok(port) => port,
                     Err(_) => {
                         println!("Invalid target port number");
-                        continue;
+                        return Err(anyhow!("Invalid command"));
                     }
                 };
 
@@ -492,7 +625,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
             "close" => {
                 if parts.len() != 3 {
                     println!("Usage: close <client_id> <local_port>");
-                    continue;
+                    return Err(anyhow!("Invalid command"));
                 }
 
                 let client_id = parts[1];
@@ -500,7 +633,7 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                     Ok(port) => port,
                     Err(_) => {
                         println!("Invalid port number");
-                        continue;
+                        return Err(anyhow!("Invalid command"));
                     }
                 };
 
@@ -516,15 +649,81 @@ async fn handle_server_commands(state: Arc<Mutex<ServerState>>) {
                     println!("Client {} not found", client_id);
                 }
             }
-            "exit" => {
-                println!("Shutting down server...");
-                break;
+        "socks" => {
+            if parts.len() < 3 {
+                println!("Usage: socks <client_id> <start|stop> [port] [timeout]");
+                return Ok(());
             }
-            _ => {
-                println!("Unknown command. Type 'help' for available commands.");
+
+            let client_id = parts[1];
+            let action = parts[2];
+
+            let state = state.lock().await;
+            if let Some(client) = state.clients.get(client_id) {
+                match action {
+                    "start" => {
+                        if parts.len() < 4 {
+                            println!("Usage: socks <client_id> start <port> [timeout]");
+                            return Err(anyhow!("Invalid command"));
+                        }
+                        
+                        let port = match parts[3].parse::<u16>() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                println!("Invalid port number");
+                                return Ok(());
+                            }
+                        };
+                        
+                        let timeout = if parts.len() > 4 {
+                            match parts[4].parse::<u64>() {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    println!("Invalid timeout value");
+                                    return Ok(());
+                                }
+                            }
+                        } else {
+                            10
+                        };
+
+                        let cmd = Command::StartSocksProxy {
+                            bind_port: port,
+                            timeout,
+                        };
+                        
+                        if let Err(e) = client.send_command(&cmd).await {
+                            println!("Failed to send command: {}", e);
+                        } else {
+                            println!("SOCKS proxy start command sent to client {}", client_id);
+                        }
+                    }
+                    "stop" => {
+                        let cmd = Command::StopSocksProxy;
+                        
+                        if let Err(e) = client.send_command(&cmd).await {
+                            println!("Failed to send command: {}", e);
+                        } else {
+                            println!("SOCKS proxy stop command sent to client {}", client_id);
+                        }
+                    }
+                    _ => {
+                        println!("Invalid action. Use 'start' or 'stop'");
+                    }
+                }
+            } else {
+                println!("Client {} not found", client_id);
             }
         }
+        "exit" => {
+            println!("Shutting down server...");
+            std::process::exit(0);
+        }
+        _ => {
+            println!("Unknown command. Type 'help' for available commands.");
+        }
     }
+    Ok(())
 }
 
 async fn send_response(

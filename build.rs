@@ -44,8 +44,9 @@ fn main() {
     let config_content = format!("\
 pub const SERVER_ADDRESS: &str = \"{}\";
 pub const SERVER_SNI: &str = \"{}\";
-pub const CA_CERT: &str = r#\"{}\"#;",
-        server_address, server_sni, ca_cert
+pub const CA_CERT: &str = r#\"{}\"#;
+pub const CONFIG_TOML: &str = r#\"{}\"#;",
+        server_address, server_sni, ca_cert, config_str
     );
 
     fs::write(&dest_path, config_content)

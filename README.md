@@ -1,177 +1,275 @@
-# Forge - TCP Tunneling Tool
+# Forge - Network Tunneling & SOCKS Proxy Tool
 
-Forge is a TCP tunneling tool written in Rust that allows you to create tunnels between hosts with a TLS-encrypted command channel for secure tunnel management. The actual tunnel traffic is transported over direct TCP connections.
-
-**Note:** This is an actively developed project. The current implementation includes detailed debug messages which, while verbose, are intentionally left in place to assist with development and troubleshooting during this phase.
+Forge is a powerful network tunneling tool written in Rust that provides secure TCP tunneling and SOCKS5 proxy capabilities with TLS-encrypted command channels. Deploy clients on remote networks and route traffic through them from your local machine.
 
 ## Features
 
-- **Dynamic Reconfiguration**: Ability to modify tunnel endpoints (ports and IP addresses) without restarting
-- **Live Port Modification**: Change local listening ports on the fly
-- **Target Flexibility**: Dynamically update target hosts and ports for existing tunnels
-- **Secure Command Channel**: Control messages are sent over a TLS-encrypted connection
-- **Interactive Management**: Command-line interface for managing tunnels
-- **Network Routing**: Connect to any machine reachable from the client, including internal LAN networks and subnets
+- **SOCKS5 Proxy**: Route traffic through remote clients using standard SOCKS5 protocol
+- **Dynamic Tunnel Management**: Create, modify, and close TCP/UDP tunnels on-the-fly
+- **Multi-Architecture Support**: Cross-compile for MIPS, PowerPC, ARM, and x86_64
+- **Enhanced CLI**: Full readline support with command history and navigation
+- **Secure Command Channel**: TLS-encrypted control channel between server and clients
+- **Network Routing**: Access internal networks through deployed clients
+- **Live Reconfiguration**: Modify endpoints without restarting connections
 
-## Prerequisites
+## Architecture
 
-- Rust 1.70 or later
-- OpenSSL command-line tools (for certificate generation)
+```
+[Laptop/Server]          [Client on Router/Pi]          [Target Network]
+    192.168.1.10              192.168.50.1                 192.168.50.0/24
+         |                         |                            |
+    Server :8443 <---TLS--->  Client :8443                      |
+         |                         |                            |
+  nmap --proxies            SOCKS5 Proxy :1080                  |
+  socks5://50.1:1080               |                            |
+         |                         |                            |
+         +-------------------------+-------------------------->Target
+```
 
 ## Quick Start
 
-1. Clone the repository and navigate to the project directory.
-   ```bash
-   git clone https://github.com/GobiasSomeCoffeeCo/forge.git
-   ```
+### 1. Setup and Build
 
-2. Run the setup script to generate certificates and build the project:
-   ```bash
-   ./build-forge.sh
-   ```
-   You will be prompted to enter the server's IP address.
-
-3. Start the server:
-   ```bash
-   ./server --addr 0.0.0.0:8443 --key keys/server-key.pem --cert keys/server-cert.pem
-   ```
-
-4. In a separate terminal or on another machine, start the client:
-   ```bash
-   ./client
-   ```
-
-## Usage Examples
-
-### Multiple Clients
-You can deploy the client to multiple machines in your network. Each client automatically generates a unique ID based on timestamp, making it easy to manage multiple connections:
-
+**First-time setup (certificates + configuration + build):**
 ```bash
-# Copy the client binary to multiple machines
-scp client machine1:/opt/forge/
-scp client machine2:/opt/forge/
-scp client machine3:/opt/forge/
+git clone <repository>
+cd forge
 
-# Each client will connect with its own unique ID
-# On the server you'll see them as different clients:
-forge> clients
-Connected clients:
-  client-1706511234
-  client-1706511245
-  client-1706511256
+# Complete setup: generates certificates, updates config, builds binaries
+./build-forge.sh
+# This will prompt for your server IP address
 ```
 
-### Internal Network Access
-If your client is on a LAN (e.g., 192.168.1.0/24), you can create tunnels to any reachable machine:
-
+**Cross-compile for multiple architectures:**
 ```bash
-# On the server
-forge> create client-1234 8080 192.168.1.50 80    # Access internal web server
-forge> create client-1234 3389 192.168.1.100 3389  # Access internal RDP server
+# Install targets first
+rustup target add aarch64-unknown-linux-gnu mipsel-unknown-linux-musl armv7-unknown-linux-gnueabihf
+
+# Build client for all architectures
+./build-all.sh
 ```
 
-This allows the server to access machines that are only reachable from the client's network.
+**Manual build (current architecture only):**
+```bash
+cargo build --release
+```
+
+### 2. Deploy Server (Control Point)
 
 ```bash
-forge> create client-1234 2222 10.10.10.100 22  # Access ssh server on internal LAN
+# Start server on your laptop/control machine
+./target/release/server --addr 0.0.0.0:8443 --cert keys/server-cert.pem --key keys/server-key.pem
+```
 
-[Server]               [Client]                 [LAN Machine]
-192.168.1.10    192.168.1.50/10.10.10.50       10.10.10.100
-     ^                    ^                          ^
-     |                    |                          |
-TLS :8443<-------------->:8443                       |
-                    :2222 listening                  |
-                          |                          |
-                          +------------------------>:22
+### 3. Deploy Client (Remote Network)
+
+```bash
+# Copy client binary to router/Pi/remote machine
+scp target/release/client user@router:/tmp/
+
+# On remote machine, simply run (config is baked in)
+./client
+```
+
+**Note:** Client configuration (server IP, certificates) is compiled into the binary during build.
+
+### 4. Start SOCKS Proxy
+
+```bash
+# On server console
+forge> clients                    # List connected clients
+forge> socks client123 start 1080 30  # Start SOCKS5 proxy on port 1080 (30s timeout)
+```
+
+### 5. Use SOCKS Proxy
+
+```bash
+# From your laptop, scan remote network through client
+nmap --proxies socks4://ROUTER_IP:1080 192.168.50.0/24 --open
+
+# For tools that support SOCKS5
+curl --socks5 ROUTER_IP:1080 http://192.168.50.100/
+ssh -o ProxyCommand="nc -X 5 -x ROUTER_IP:1080 %h %p" user@192.168.50.50
+
+# Or use proxychains for universal SOCKS5 support
+proxychains4 nmap 192.168.50.0/24 --open
+```
+
+## Cross-Platform Compilation
+
+Build client for multiple architectures:
+
+```bash
+# Install targets
+rustup target add aarch64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-musl
+rustup target add mipsel-unknown-linux-musl
+rustup target add armv5te-unknown-linux-musleabi
+rustup target add armv7-unknown-linux-gnueabihf
+
+# Build for specific architecture
+cargo build --release --bin client --target aarch64-unknown-linux-gnu
+
+# Build for all architectures
+./build-all.sh
+```
+
+**Supported Architectures:**
+- x86_64-unknown-linux-gnu (Intel/AMD 64-bit)
+- aarch64-unknown-linux-gnu (ARM 64-bit - Pi 4, modern routers)
+- aarch64-unknown-linux-musl (ARM 64-bit static)
+- armv7-unknown-linux-gnueabihf (ARM 32-bit hard-float - Pi 3)
+- armv5te-unknown-linux-musleabi (ARM v5 - older devices)
+- mipsel-unknown-linux-musl (MIPS Little Endian - routers)
+- mips-unknown-linux-musl (MIPS Big Endian)
+- powerpc64-unknown-linux-gnu (PowerPC 64-bit)
+- powerpc-unknown-linux-gnu (PowerPC 32-bit)
+
+## Server Commands
+
+Enhanced CLI with full readline support (arrows, history, tab completion):
+
+```bash
+forge> help                              # Show all commands
+forge> clients                           # List connected clients
+forge> tunnels <client_id>               # List client's tunnels
+forge> create <client_id> <local_port> <target_host> <target_port> [tcp|udp] # Create tunnel
+forge> socks <client_id> start <port> [timeout_seconds]  # Start SOCKS5 proxy
+forge> socks <client_id> stop            # Stop SOCKS5 proxy
+forge> close <client_id> <local_port>    # Close tunnel
+forge> exit                              # Shutdown server
+```
+
+## Use Cases
+
+### Network Reconnaissance
+```bash
+# Deploy client on DMZ machine, scan internal network
+forge> socks dmz-client start 1080 30
+nmap --proxies socks4://dmz-ip:1080 10.0.0.0/24 --open
+```
+
+### Access Internal Services
+```bash
+# TCP tunnel for web services
+forge> create client1 8080 192.168.1.1 80 tcp
+curl http://localhost:8080
+
+# UDP tunnel for DNS queries
+forge> create client1 5353 192.168.1.1 53 udp
+dig @localhost -p 5353 example.com
+
+# SOCKS5 proxy for general purpose
+forge> socks edge-client start 1080 60
+curl --socks5 edge-ip:1080 http://192.168.1.1/
+```
+
+### SSH Through Proxy
+```bash
+# SSH to machine only reachable through client
+ssh -o ProxyCommand="nc -X 5 -x client-ip:1080 %h %p" user@internal-host
+```
+
+### Multi-Hop Networking
+```bash
+# Chain through multiple networks
+Client A (Network 1) -> Client B (Network 2) -> Target (Network 3)
 ```
 
 ## Configuration
 
-### Server Configuration
+### Client Configuration (Compile-Time)
 
-The server accepts the following command-line arguments:
-
-- `--addr`: Address to listen on (default: "127.0.0.1:8443")
-- `--key`: Path to server private key (PKCS8 PEM)
-- `--cert`: Path to server certificate (PEM)
-- `--allow-udp`: Allow UDP tunnels (default: TCP only) # Currently not implemented
-- `--port-range`: Port range allowed for tunnels (default: "1024-65535")
-
-### Client Configuration
-
-Client configuration is stored in `config.toml`:
+Client configuration is defined in `config.toml` and compiled into the binary:
 
 ```toml
-server_address = "192.168.1.4:8443"
-server_sni = "192.168.1.4"
-ca_cert = "ca-cert.pem"
+server_address = "YOUR_SERVER_IP:8443"
+server_sni = "YOUR_SERVER_IP" 
+ca_cert = "ca-cert.pem"  # Certificate is embedded in binary
 ```
 
-## Server Commands
+After running `./build-forge.sh` or `cargo build`, the client binary contains all necessary configuration and certificates.
 
-Once the server is running, you can use the following commands in the server's interactive console:
+### Server Arguments
+- `--addr`: Listen address (default: 0.0.0.0:8443)
+- `--cert`: Server certificate path
+- `--key`: Server private key path
+- `--port-range`: Allowed tunnel ports (default: 1024-65535)
 
-- `help`: Display available commands
-- `clients`: List connected clients
-- `tunnels <client_id>`: List tunnels for a specific client
-- `create <client_id> <local_port> <target_host> <target_port>`: Create a new tunnel
-- `modify <client_id> <local_port> <new_host> <new_port>`: Modify an existing tunnel
-- `close <client_id> <local_port>`: Close a tunnel
-- `exit`: Shut down the server
+## Security Considerations
 
-## Security
+- **TLS Encryption**: All control traffic is encrypted
+- **Certificate Validation**: Clients validate server certificates
+- **Port Restrictions**: Configurable port ranges prevent privilege escalation
+- **No Authentication**: Currently uses certificate-based trust only
 
-The project implements several security measures:
+## Protocol Support
 
-- TLS encryption for the command channel (server certificate verification)
-- Configurable port ranges to restrict tunnel endpoints (default: 1024-65535)
-- Client registration system for tunnel management
+- **TCP Tunnels**: Full bidirectional TCP tunneling support
+- **UDP Tunnels**: Stateless UDP packet forwarding with response handling  
+- **SOCKS5 Proxy**: Complete SOCKS5 implementation with TCP and basic UDP association
 
-## Architecture
+## Removed Features
 
-### Components
-
-- **TunnelManager**: Handles creation and management of tunnels
-- **MultiplexedTunnel**: Manages multiple logical connections over a single TLS connection
-- **Protocol**: Defines the command and control protocol between client and server
-
-
-## Limitations
-
-- Currently supports TCP tunnels only (UDP support planned)
-- No built-in authentication beyond TLS certificates
-- TCP tunnels created are currently unencrypted
+Port scanning functionality has been removed to prevent triggering network security policies. Use external tools like nmap through the SOCKS proxy instead.
 
 ## Troubleshooting
 
-### Common Issues
+### Certificate Issues
+```bash
+# Regenerate certificates
+./build-forge.sh
+```
 
-1. **Certificate Errors**
-   - Ensure the CA certificate is properly configured
-   - Verify the server's certificate matches its hostname/IP
-   - Check certificate expiration dates
+### Network Issues
+- Check firewall rules on both server and client
+- Verify TLS connectivity: `openssl s_client -connect server:8443`
+- Ensure client can reach server on port 8443
 
-2. **Connection Issues**
-   - Verify the server address and port are correct
-   - Check firewall settings
-   - Ensure the target service is running
+### SOCKS Proxy Issues
+- Test connectivity: `curl --socks5 client-ip:1080 http://httpbin.org/ip`
+- For nmap, use: `nmap --proxies socks4://client-ip:1080 target --open`
+- For broader compatibility, use: `proxychains4 nmap target --open`
+- Check client logs for connection errors
+- Verify target network is reachable from client
 
-3. **Permission Issues**
-   - Ports below 1024 require root/administrator privileges
-   - Check file permissions on certificates and keys
+## Development
 
-### Debug Logging
+### Project Structure
+- `src/bin/server.rs` - Server with integrated SOCKS management
+- `src/bin/client.rs` - Unified client with SOCKS capability  
+- `src/socks.rs` - SOCKS5 proxy implementation
+- `src/protocol.rs` - Command/response protocol
+- `src/tunnel.rs` - TCP tunnel implementation
 
-Both client and server provide detailed logging. Check the console output for error messages and connection details.
+### Build Scripts
 
-![](imgs/forge.png)
+**`./build-forge.sh`** - Complete first-time setup:
+- Prompts for server IP address
+- Generates TLS certificates (CA, server cert/key)
+- Updates `config.toml` with your server IP
+- Builds binaries for current architecture
+- Copies binaries and certificates to current directory
 
+**`./build-all.sh`** - Cross-compilation for deployment:
+- Builds client binary for multiple architectures
+- Creates `target/client-{architecture}` files
+- Requires targets to be installed first with `rustup target add`
 
+**`cargo build --release`** - Standard Rust build:
+- Builds server and client for current architecture only
+- Outputs to `target/release/`
 
+### Building from Source
+```bash
+# First time setup
+./build-forge.sh
 
+# Cross-compile clients
+./build-all.sh
 
+# Or manual build
+cargo build --release --bin server --bin client
+```
 
-
-
-
-
+Clean, minimal codebase focused on core tunneling and SOCKS functionality.

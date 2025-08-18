@@ -3,6 +3,7 @@ include!(concat!(env!("OUT_DIR"), "/config.rs"));
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use forge::protocol::{Command, Response, TunnelDirection, TunnelInfo};
+use forge::socks::{SocksConfig, SocksProxy};
 use rustls_pemfile::certs;
 use std::collections::HashMap;
 use std::env;
@@ -10,7 +11,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::pki_types::{CertificateDer, DnsName, ServerName};
@@ -42,12 +43,14 @@ struct TunnelConfig {
 
 struct TunnelManager {
     tunnels: Mutex<HashMap<u16, TunnelConfig>>,
+    socks_proxy: Mutex<Option<SocksProxy>>,
 }
 
 impl TunnelManager {
     fn new() -> Self {
         Self {
             tunnels: Mutex::new(HashMap::new()),
+            socks_proxy: Mutex::new(None),
         }
     }
 
@@ -98,7 +101,7 @@ async fn create_tls_connection(
         .context("TLS handshake failed")
 }
 
-async fn start_tunnel_listener(local_port: u16, tunnel_manager: Arc<TunnelManager>) -> Result<()> {
+async fn start_tcp_tunnel_listener(local_port: u16, tunnel_manager: Arc<TunnelManager>) -> Result<()> {
     let local_addr = format!("0.0.0.0:{}", local_port);
 
     let listener = loop {
@@ -174,7 +177,7 @@ async fn handle_connection(
     let (mut target_rd, mut target_wr) = target_socket.split();
 
     let client_to_target = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 32768];
         loop {
             let n = local_rd.read(&mut buf).await?;
             if n == 0 {
@@ -186,7 +189,7 @@ async fn handle_connection(
     };
 
     let target_to_client = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 32768];
         loop {
             let n = target_rd.read(&mut buf).await?;
             if n == 0 {
@@ -217,8 +220,83 @@ async fn send_command(
         Ok(Response::Ok) => Ok(()),
         Ok(Response::Error(e)) => Err(anyhow!("Server error: {}", e)),
         Ok(Response::TunnelList(_)) => Ok(()),
+        // Ok(Response::ScanResults(_)) => Ok(()), // Removed scanning
         Err(e) => Err(anyhow!("Failed to parse server response: {}", e)),
     }
+}
+
+async fn start_udp_tunnel_listener(local_port: u16, tunnel_manager: Arc<TunnelManager>) -> Result<()> {
+    use tokio::net::UdpSocket;
+    
+    let local_addr = format!("0.0.0.0:{}", local_port);
+    let socket = UdpSocket::bind(&local_addr).await
+        .with_context(|| format!("Failed to bind UDP socket to {}", local_addr))?;
+    
+    println!("UDP tunnel listener started on {}", local_addr);
+
+    let mut shutdown_rx = {
+        let tunnels = tunnel_manager.tunnels.lock().unwrap();
+        tunnels
+            .get(&local_port)
+            .ok_or_else(|| anyhow!("No tunnel configuration found for port {}", local_port))?
+            .shutdown
+            .subscribe()
+    };
+
+    let mut buf = vec![0u8; 32768];
+    
+    loop {
+        tokio::select! {
+            result = socket.recv_from(&mut buf) => {
+                match result {
+                    Ok((n, peer_addr)) => {
+                        let (target_host, target_port) = {
+                            let tunnels = tunnel_manager.tunnels.lock().unwrap();
+                            if let Some(config) = tunnels.get(&local_port) {
+                                (config.target_host.clone(), config.target_port)
+                            } else {
+                                eprintln!("No tunnel config found for port {}", local_port);
+                                continue;
+                            }
+                        };
+
+                        // Forward UDP packet to target
+                        if let Ok(target_addr) = format!("{}:{}", target_host, target_port).parse::<std::net::SocketAddr>() {
+                            if let Ok(target_socket) = UdpSocket::bind("0.0.0.0:0").await {
+                                if let Err(e) = target_socket.send_to(&buf[..n], target_addr).await {
+                                    eprintln!("Failed to forward UDP packet: {}", e);
+                                }
+                                
+                                // Listen for response (simplified - in practice you'd want better state management)
+                                let mut response_buf = vec![0u8; 32768];
+                                tokio::select! {
+                                    result = target_socket.recv_from(&mut response_buf) => {
+                                        if let Ok((resp_n, _)) = result {
+                                            if let Err(e) = socket.send_to(&response_buf[..resp_n], peer_addr).await {
+                                                eprintln!("Failed to send UDP response: {}", e);
+                                            }
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
+                                        // Timeout waiting for response
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("UDP recv error: {}", e);
+                    }
+                }
+            }
+            _ = shutdown_rx.recv() => {
+                println!("UDP tunnel on port {} shutting down", local_port);
+                break;
+            }
+        }
+    }
+    
+    Ok(())
 }
 
 async fn send_response(
@@ -303,7 +381,7 @@ async fn handle_server_commands(
 
                 let tm = tunnel_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = start_tunnel_listener(new_local_port, tm).await {
+                    if let Err(e) = start_tcp_tunnel_listener(new_local_port, tm).await {
                         eprintln!("Failed to start tunnel listener: {}", e);
                     }
                 });
@@ -315,6 +393,7 @@ async fn handle_server_commands(
                 target_host,
                 target_port,
                 direction: _,
+                protocol,
             } => {
                 if let Err(e) = tunnel_manager.modify_tunnel(
                     local_port,
@@ -328,8 +407,20 @@ async fn handle_server_commands(
 
                 let tm = tunnel_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = start_tunnel_listener(local_port, tm).await {
-                        eprintln!("Failed to start tunnel listener: {}", e);
+                    match protocol {
+                        forge::protocol::TunnelProtocol::Tcp => {
+                            if let Err(e) = start_tcp_tunnel_listener(local_port, tm).await {
+                                eprintln!("Failed to start TCP tunnel listener: {}", e);
+                            }
+                        }
+                        forge::protocol::TunnelProtocol::Udp => {
+                            if let Err(e) = start_udp_tunnel_listener(local_port, tm).await {
+                                eprintln!("Failed to start UDP tunnel listener: {}", e);
+                            }
+                        }
+                        forge::protocol::TunnelProtocol::Socks5 => {
+                            eprintln!("SOCKS5 protocol should use separate SOCKS proxy functionality");
+                        }
                     }
                 });
 
@@ -364,8 +455,11 @@ async fn handle_server_commands(
                             target_host: config.target_host.clone(),
                             target_port: config.target_port,
                             direction: TunnelDirection::Forward,
+                            protocol: forge::protocol::TunnelProtocol::Tcp,
                             bytes_sent: 0,
                             bytes_received: 0,
+                            connections_active: 0,
+                            connections_total: 0,
                         })
                         .collect::<Vec<_>>()
                 };
@@ -375,6 +469,59 @@ async fn handle_server_commands(
             Command::Register { client_id } => {
                 println!("Registered as client {}", client_id);
                 send_response(&mut writer, &Response::Ok).await?;
+            }
+            Command::StartSocksProxy { bind_port, timeout } => {
+                println!("Starting SOCKS5 proxy on port {}", bind_port);
+                
+                let mut socks_proxy_guard = tunnel_manager.socks_proxy.lock().unwrap();
+                
+                if socks_proxy_guard.is_some() {
+                    send_response(&mut writer, &Response::Error("SOCKS proxy already running".to_string())).await?;
+                } else {
+                    let config = SocksConfig {
+                        bind_addr: format!("0.0.0.0:{}", bind_port).parse().unwrap(),
+                        timeout: Duration::from_secs(timeout),
+                        enable_udp: true,
+                    };
+                    
+                    let mut proxy = SocksProxy::new(config);
+                    
+                    // Start the proxy in a background task
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy.start().await {
+                            eprintln!("SOCKS proxy error: {}", e);
+                        }
+                    });
+                    
+                    // Store a tracking proxy instance
+                    let tracking_proxy = SocksProxy::new(SocksConfig {
+                        bind_addr: format!("0.0.0.0:{}", bind_port).parse().unwrap(),
+                        timeout: Duration::from_secs(timeout),
+                        enable_udp: true,
+                    });
+                    
+                    *socks_proxy_guard = Some(tracking_proxy);
+                    
+                    println!("SOCKS5 proxy started on port {}", bind_port);
+                    send_response(&mut writer, &Response::Ok).await?;
+                }
+            }
+            Command::StopSocksProxy => {
+                println!("Stopping SOCKS5 proxy");
+                
+                let mut socks_proxy_guard = tunnel_manager.socks_proxy.lock().unwrap();
+                
+                if socks_proxy_guard.is_none() {
+                    send_response(&mut writer, &Response::Error("No SOCKS proxy running".to_string())).await?;
+                } else {
+                    *socks_proxy_guard = None;
+                    println!("SOCKS5 proxy stopped");
+                    send_response(&mut writer, &Response::Ok).await?;
+                }
+            }
+            Command::ScanPorts { .. } => {
+                // TODO: Implement port scanning on client side
+                send_response(&mut writer, &Response::Error("Not implemented".to_string())).await?;
             }
         }
     }

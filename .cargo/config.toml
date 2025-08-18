@@ -1,2 +1,39 @@
+[profile.release]
+incremental = false     # Disable incremental compilation.
+opt-level = "z"         # Optimize for size.
+lto = "fat"              # Enable Link Time Optimization
+codegen-units = 1       # Reduce number of codegen units to increase optimizations.
+strip = true            # Automatically strip symbols from the binary.
+panic="abort"           # Abort on panic.
+
+# Raspberry Pi cross-compilation targets
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "arm-linux-musleabihf-gcc"
+
+[target.arm-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[target.arm-unknown-linux-musleabihf]
+linker = "arm-linux-musleabihf-gcc"
+
+[target.mipsel-unknown-linux-musl]
+linker = "/home/user/Programming/git/buildroot/output/host/bin/mipsel-linux-gcc"
+ar = "/home/user/Programming/git/buildroot/output/host/bin/mipsel-linux-ar"
+rustflags = [
+    "-C", "relocation-model=static",
+    "-l", "gcc_eh",
+    "-L", "/home/user/Programming/git/buildroot/output/host/lib",
+    "-L", "/home/user/Programming/git/buildroot/output/host/lib/gcc/mipsel-buildroot-linux-musl/12.3.0",
+    "-L", "/home/user/Programming/git/buildroot/output/host/mipsel-buildroot-linux-musl/lib",
+    "-L", "/home/user/Programming/git/buildroot/output/host/mipsel-buildroot-linux-musl/sysroot/lib",
+    "-L", "/home/user/Programming/git/buildroot/output/host/mipsel-buildroot-linux-musl/sysroot/usr/lib"
+]
