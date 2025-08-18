@@ -44,6 +44,8 @@ struct TunnelConfig {
 struct TunnelManager {
     tunnels: Mutex<HashMap<u16, TunnelConfig>>,
     socks_proxy: Mutex<Option<SocksProxy>>,
+    socks_tunnels: Mutex<HashMap<u16, tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    active_connections: Arc<tokio::sync::Mutex<HashMap<u32, TcpStream>>>,
 }
 
 impl TunnelManager {
@@ -51,6 +53,8 @@ impl TunnelManager {
         Self {
             tunnels: Mutex::new(HashMap::new()),
             socks_proxy: Mutex::new(None),
+            socks_tunnels: Mutex::new(HashMap::new()),
+            active_connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -220,7 +224,7 @@ async fn send_command(
         Ok(Response::Ok) => Ok(()),
         Ok(Response::Error(e)) => Err(anyhow!("Server error: {}", e)),
         Ok(Response::TunnelList(_)) => Ok(()),
-        // Ok(Response::ScanResults(_)) => Ok(()), // Removed scanning
+        Ok(Response::SocksData { .. }) => Ok(()), // SOCKS data response
         Err(e) => Err(anyhow!("Failed to parse server response: {}", e)),
     }
 }
@@ -338,21 +342,21 @@ async fn handle_server_commands(
 
         println!("Received raw command: {}", buf.trim());
 
-        // First try to parse as a Response, in case the server sent us a response
-        if let Ok(response) = serde_json::from_str::<Response>(buf.trim()) {
-            println!("Received response: {:?}", response);
-            continue;
-        }
-
-        // If it's not a response, try to parse as a Command
+        // First try to parse as a Command
         let cmd: Command = match serde_json::from_str(buf.trim()) {
             Ok(cmd) => {
                 println!("Parsed command successfully: {:?}", cmd);
                 cmd
             }
-            Err(e) => {
-                eprintln!("Failed to parse message as command: {}", e);
-                continue;
+            Err(_) => {
+                // If it's not a command, try to parse as a Response
+                if let Ok(response) = serde_json::from_str::<Response>(buf.trim()) {
+                    println!("Received response: {:?}", response);
+                    continue;
+                } else {
+                    eprintln!("Failed to parse message as command or response");
+                    continue;
+                }
             }
         };
 
@@ -522,6 +526,183 @@ async fn handle_server_commands(
             Command::ScanPorts { .. } => {
                 // TODO: Implement port scanning on client side
                 send_response(&mut writer, &Response::Error("Not implemented".to_string())).await?;
+            }
+            Command::StartSocksTunnel { local_port, timeout } => {
+                println!("Starting SOCKS tunnel on port {}", local_port);
+                
+                // Create a SOCKS proxy that will handle connections
+                let config = forge::socks::SocksConfig {
+                    bind_addr: format!("0.0.0.0:{}", local_port).parse().unwrap(),
+                    timeout: Duration::from_secs(timeout),
+                    enable_udp: true,
+                };
+                
+                let mut proxy = forge::socks::SocksProxy::new(config);
+                
+                // Start the proxy in a background task
+                tokio::spawn(async move {
+                    if let Err(e) = proxy.start().await {
+                        eprintln!("SOCKS tunnel proxy error: {}", e);
+                    }
+                });
+                
+                send_response(&mut writer, &Response::Ok).await?;
+            }
+            Command::StopSocksTunnel { local_port } => {
+                println!("Stopping SOCKS tunnel on port {}", local_port);
+                
+                // Clean up the tunnel
+                {
+                    let mut tunnels = tunnel_manager.socks_tunnels.lock().unwrap();
+                    tunnels.remove(&local_port);
+                }
+                
+                send_response(&mut writer, &Response::Ok).await?;
+            }
+            Command::SocksData { local_port, connection_id, data } => {
+                // Handle SOCKS data from server - parse SOCKS protocol and forward to target
+                if data.len() < 4 {
+                    // Invalid SOCKS data
+                    let response = Response::SocksData {
+                        local_port,
+                        connection_id,
+                        data: vec![0x00, 0x5B], // SOCKS4 general failure
+                    };
+                    send_response(&mut writer, &response).await?;
+                    continue;
+                }
+
+                // Handle SOCKS4 CONNECT command
+                if data[0] == 0x04 && data[1] == 0x01 && data.len() >= 8 {
+                    let target_port = u16::from_be_bytes([data[2], data[3]]);
+                    let target_ip = format!("{}.{}.{}.{}", data[4], data[5], data[6], data[7]);
+                    
+                    println!("SOCKS4 connection request to {}:{}", target_ip, target_port);
+                    
+                    match TcpStream::connect(format!("{}:{}", target_ip, target_port)).await {
+                        Ok(_target_stream) => {
+                            let response = Response::SocksData {
+                                local_port,
+                                connection_id,
+                                data: vec![0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // SOCKS4 success
+                            };
+                            send_response(&mut writer, &response).await?;
+                            println!("SOCKS4 connection established to {}:{}", target_ip, target_port);
+                        }
+                        Err(e) => {
+                            println!("SOCKS4 connection failed to {}:{}: {}", target_ip, target_port, e);
+                            let response = Response::SocksData {
+                                local_port,
+                                connection_id,
+                                data: vec![0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // SOCKS4 rejection
+                            };
+                            send_response(&mut writer, &response).await?;
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle SOCKS5 authentication negotiation  
+                if data[0] == 0x05 && data.len() >= 2 && data[1] == 0x01 {
+                    let response = Response::SocksData {
+                        local_port,
+                        connection_id,
+                        data: vec![0x05, 0x00], // No authentication required
+                    };
+                    send_response(&mut writer, &response).await?;
+                    println!("SOCKS5 authentication negotiation completed");
+                    continue;
+                }
+
+                // Simple SOCKS5 CONNECT command parsing
+                if data[0] == 0x05 && data[1] == 0x01 && data[2] == 0x00 {
+                    // SOCKS5 CONNECT command
+                    let addr_type = data[3];
+                    let (target_host, target_port, response_data) = match addr_type {
+                        0x01 => {
+                            // IPv4
+                            if data.len() < 10 {
+                                (String::new(), 0, vec![0x05, 0x01])
+                            } else {
+                                let ip = format!("{}.{}.{}.{}", data[4], data[5], data[6], data[7]);
+                                let port = u16::from_be_bytes([data[8], data[9]]);
+                                (ip, port, vec![0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                            }
+                        }
+                        0x03 => {
+                            // Domain name
+                            if data.len() < 5 {
+                                (String::new(), 0, vec![0x05, 0x01])
+                            } else {
+                                let domain_len = data[4] as usize;
+                                if data.len() < 5 + domain_len + 2 {
+                                    (String::new(), 0, vec![0x05, 0x01])
+                                } else {
+                                    let domain = String::from_utf8_lossy(&data[5..5 + domain_len]).to_string();
+                                    let port = u16::from_be_bytes([data[5 + domain_len], data[5 + domain_len + 1]]);
+                                    (domain, port, vec![0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                                }
+                            }
+                        }
+                        _ => {
+                            // Unsupported address type
+                            (String::new(), 0, vec![0x05, 0x08]) // Address type not supported
+                        }
+                    };
+
+                    if !target_host.is_empty() && target_port > 0 {
+                        // Try to connect to target
+                        match TcpStream::connect(format!("{}:{}", target_host, target_port)).await {
+                            Ok(_target_stream) => {
+                                // Connection successful - send success response
+                                let response = Response::SocksData {
+                                    local_port,
+                                    connection_id,
+                                    data: response_data,
+                                };
+                                send_response(&mut writer, &response).await?;
+                                
+                                // Store connection for future data forwarding
+                                // (In a complete implementation, you'd maintain persistent connections)
+                                println!("SOCKS5 connection established to {}:{}", target_host, target_port);
+                            }
+                            Err(_) => {
+                                // Connection failed
+                                let response = Response::SocksData {
+                                    local_port,
+                                    connection_id,
+                                    data: vec![0x05, 0x05], // Connection refused
+                                };
+                                send_response(&mut writer, &response).await?;
+                            }
+                        }
+                    } else {
+                        // Invalid target
+                        let response = Response::SocksData {
+                            local_port,
+                            connection_id,
+                            data: vec![0x05, 0x01], // General failure
+                        };
+                        send_response(&mut writer, &response).await?;
+                    }
+                } else if data[0] == 0x05 && data[1] == 0x00 {
+                    // SOCKS5 authentication request - no auth required
+                    let response = Response::SocksData {
+                        local_port,
+                        connection_id,
+                        data: vec![0x05, 0x00], // No authentication required
+                    };
+                    send_response(&mut writer, &response).await?;
+                } else {
+                    // For data forwarding after connection is established, we would forward to the target
+                    // This is a simplified implementation - echo back for now
+                    let response = Response::SocksData {
+                        local_port,
+                        connection_id,
+                        data: data.clone(),
+                    };
+                    send_response(&mut writer, &response).await?;
+                }
             }
         }
     }

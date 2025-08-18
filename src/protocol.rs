@@ -40,6 +40,18 @@ pub enum Command {
         ports: Vec<u16>,
         timeout_ms: u64,
     },
+    StartSocksTunnel {
+        local_port: u16,
+        timeout: u64,
+    },
+    StopSocksTunnel {
+        local_port: u16,
+    },
+    SocksData {
+        local_port: u16,
+        connection_id: u32,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -67,4 +79,9 @@ pub enum Response {
     Ok,
     TunnelList(Vec<TunnelInfo>),
     Error(String),
+    SocksData {
+        local_port: u16,
+        connection_id: u32,
+        data: Vec<u8>,
+    },
 }

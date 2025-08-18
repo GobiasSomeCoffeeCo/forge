@@ -287,6 +287,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "once_cell",
  "rustls-pemfile",
  "rustyline",
  "serde",

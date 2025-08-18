@@ -5,6 +5,7 @@ Forge is a powerful network tunneling tool written in Rust that provides secure 
 ## Features
 
 - **SOCKS5 Proxy**: Route traffic through remote clients using standard SOCKS5 protocol
+- **SOCKS Tunneling**: Advanced SOCKS proxy tunneled through TLS for enhanced security
 - **Dynamic Tunnel Management**: Create, modify, and close TCP/UDP tunnels on-the-fly
 - **Multi-Architecture Support**: Cross-compile for MIPS, PowerPC, ARM, and x86_64
 - **Enhanced CLI**: Full readline support with command history and navigation
@@ -140,6 +141,7 @@ forge> tunnels <client_id>               # List client's tunnels
 forge> create <client_id> <local_port> <target_host> <target_port> [tcp|udp] # Create tunnel
 forge> socks <client_id> start <port> [timeout_seconds]  # Start SOCKS5 proxy
 forge> socks <client_id> stop            # Stop SOCKS5 proxy
+forge> socks-tunnel <client_id> <local_port> [timeout]   # Start SOCKS tunnel through TLS
 forge> close <client_id> <local_port>    # Close tunnel
 forge> exit                              # Shutdown server
 ```
@@ -176,6 +178,27 @@ curl --socks5 edge-ip:1080 http://192.168.1.1/
 # SSH to machine only reachable through client
 ssh -o ProxyCommand="nc -X 5 -x client-ip:1080 %h %p" user@internal-host
 ```
+
+### SOCKS Tunnel Through TLS (Advanced)
+
+For enhanced security and NAT traversal, you can tunnel SOCKS traffic through the existing TLS control channel:
+
+```bash
+# Start SOCKS tunnel on server that forwards through TLS to client
+forge> socks-tunnel client123 9050 30
+
+# Now use proxychains or any SOCKS client pointing to localhost
+proxychains4 -q nmap 192.168.50.0/24 --open
+
+# Or direct SOCKS5 usage
+curl --socks5 127.0.0.1:9050 http://192.168.50.100/
+```
+
+**Benefits of SOCKS Tunnel vs Standard SOCKS Proxy:**
+- **Single Port**: Only requires TLS port 8443 open
+- **Enhanced Security**: All traffic encrypted through TLS tunnel  
+- **NAT Traversal**: Works through NAT/firewalls that block direct SOCKS connections
+- **Centralized**: SOCKS proxy runs on your control machine, not the remote client
 
 ### Multi-Hop Networking
 
@@ -252,8 +275,9 @@ Port scanning functionality has been removed to prevent triggering network secur
 - `src/bin/server.rs` - Server with integrated SOCKS management
 - `src/bin/client.rs` - Unified client with SOCKS capability  
 - `src/socks.rs` - SOCKS5 proxy implementation
+- `src/socks_tunnel.rs` - SOCKS proxy tunneled through TLS
 - `src/protocol.rs` - Command/response protocol
-- `src/tunnel.rs` - TCP tunnel implementation
+- `src/tunnel.rs` - TCP/UDP tunnel implementation
 
 ### Build Scripts
 

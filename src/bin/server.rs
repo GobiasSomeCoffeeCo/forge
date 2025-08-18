@@ -45,6 +45,7 @@ struct ConnectedClient {
     writer: Arc<Mutex<BufWriter<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>>>,
     tunnels: Arc<Mutex<HashMap<u16, TunnelInfo>>>,
     socks_proxy: Arc<Mutex<Option<SocksProxy>>>,
+    socks_tunnels: Arc<Mutex<HashMap<u16, Arc<Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>>>>>>, // port -> connections
 }
 
 impl ConnectedClient {
@@ -55,6 +56,7 @@ impl ConnectedClient {
             writer: Arc::new(Mutex::new(writer)),
             tunnels: Arc::new(Mutex::new(HashMap::new())),
             socks_proxy: Arc::new(Mutex::new(None)),
+            socks_tunnels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -191,7 +193,32 @@ async fn handle_client(
             return Ok(());
         }
 
-        // Try to parse message as a Command first
+        // First try to parse as Response (SocksData responses from client)
+        if let Ok(response) = serde_json::from_str::<Response>(&buf.trim()) {
+            if let Response::SocksData { local_port, connection_id, data } = response {
+                println!("Received SocksData response: port={}, conn={}, data={:?}", local_port, connection_id, data);
+                
+                // Route response back to correct SOCKS connection
+                if let Some(ref id) = client_id {
+                    let state = state.lock().await;
+                    if let Some(client) = state.clients.get(id) {
+                        let tunnels = client.socks_tunnels.lock().await;
+                        if let Some(connections) = tunnels.get(&local_port) {
+                            let conns = connections.lock().await;
+                            if let Some(sender) = conns.get(&connection_id) {
+                                let _ = sender.send(data).await;
+                            }
+                        }
+                    }
+                }
+                continue;
+            } else {
+                println!("Received other response: {:?}", response);
+                continue;
+            }
+        }
+
+        // Try to parse message as a Command
         let parsed_command = serde_json::from_str::<Command>(&buf.trim());
 
         // Handle the message based on whether it's a command or not
@@ -206,6 +233,7 @@ async fn handle_client(
                             writer: writer.clone(),
                             tunnels: Arc::new(Mutex::new(HashMap::new())),
                             socks_proxy: Arc::new(Mutex::new(None)),
+                            socks_tunnels: Arc::new(Mutex::new(HashMap::new())),
                         });
                         state.clients.insert(id.clone(), client.clone());
                         client_id = Some(id.clone());
@@ -406,22 +434,37 @@ async fn handle_client(
                             }
                         }
                     }
+                    Command::StartSocksTunnel { .. } => {
+                        // Handled by server CLI, not here
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                let mut writer = client.writer.lock().await;
+                                send_response(&mut *writer, &Response::Error("Use server CLI for SOCKS tunnels".to_string())).await?;
+                            }
+                        }
+                    }
+                    Command::StopSocksTunnel { .. } => {
+                        // Handled by server CLI, not here
+                        if let Some(ref id) = client_id {
+                            let state = state.lock().await;
+                            if let Some(client) = state.clients.get(id) {
+                                let mut writer = client.writer.lock().await;
+                                send_response(&mut *writer, &Response::Error("Use server CLI for SOCKS tunnels".to_string())).await?;
+                            }
+                        }
+                    }
+                    Command::SocksData { .. } => {
+                        // SocksData commands from client should not reach here in normal operation
+                        // They should be handled as responses, not commands
+                        println!("Unexpected SocksData command from client");
+                    }
                 }
             }
             Err(e) => {
-                // If it's not a command, try to parse as a Response
-                match serde_json::from_str::<Response>(&buf.trim()) {
-                    Ok(response) => {
-                        println!("Received response from client: {:?}", response);
-                        // Handle client response if needed
-                        return Err(anyhow!("Invalid command"));
-                    }
-                    Err(_) => {
-                        // If it's neither a command nor a response, it's an error
-                        eprintln!("Invalid message format: {}", e);
-                        return Err(anyhow!("Invalid command"));
-                    }
-                }
+                // If it's neither a command nor a response, it's an error
+                eprintln!("Invalid message format: {}", e);
+                return Err(anyhow!("Invalid command"));
             }
         }
     }
@@ -490,6 +533,7 @@ async fn try_handle_command_parts(parts: &[&str], state: &Arc<Mutex<ServerState>
             println!("  close <client_id> <local_port> - Close tunnel");
             println!("  socks <client_id> start <port> [timeout] - Start SOCKS proxy");
             println!("  socks <client_id> stop      - Stop SOCKS proxy");
+            println!("  socks-tunnel <client_id> <local_port> [timeout] - Start SOCKS tunnel through TLS");
             println!("  exit                        - Shut down server");
         }
             "clients" => {
@@ -715,6 +759,66 @@ async fn try_handle_command_parts(parts: &[&str], state: &Arc<Mutex<ServerState>
                 println!("Client {} not found", client_id);
             }
         }
+        "socks-tunnel" => {
+            if parts.len() < 3 {
+                println!("Usage: socks-tunnel <client_id> <local_port> [timeout]");
+                return Err(anyhow!("Invalid command"));
+            }
+
+            let client_id = parts[1];
+            let local_port = match parts[2].parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => {
+                    println!("Invalid local port number");
+                    return Err(anyhow!("Invalid command"));
+                }
+            };
+            
+            let timeout = if parts.len() > 3 {
+                match parts[3].parse::<u64>() {
+                    Ok(t) => t,
+                    Err(_) => {
+                        println!("Invalid timeout value");
+                        return Err(anyhow!("Invalid command"));
+                    }
+                }
+            } else {
+                30
+            };
+
+            let state = state.lock().await;
+            if let Some(client) = state.clients.get(client_id) {
+                // Send the start command directly to the client through TLS
+                let cmd = Command::StartSocksTunnel {
+                    local_port,
+                    timeout,
+                };
+                
+                if let Err(e) = client.send_command(&cmd).await {
+                    println!("Failed to send SOCKS tunnel command: {}", e);
+                    return Err(anyhow!("Command failed"));
+                }
+                
+                // Store the connections map for this SOCKS tunnel
+                let connections = Arc::new(Mutex::new(HashMap::new()));
+                {
+                    let mut tunnels = client.socks_tunnels.lock().await;
+                    tunnels.insert(local_port, connections.clone());
+                }
+                
+                // Create a simple SOCKS proxy that will forward through the client
+                let client_clone = client.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = start_simple_socks_proxy(local_port, client_clone, connections).await {
+                        eprintln!("SOCKS tunnel proxy error: {}", e);
+                    }
+                });
+                
+                println!("SOCKS tunnel started on localhost:{} -> client {}", local_port, client_id);
+            } else {
+                println!("Client {} not found", client_id);
+            }
+        }
         "exit" => {
             println!("Shutting down server...");
             std::process::exit(0);
@@ -740,5 +844,105 @@ async fn send_response(
         .await
         .context("Failed to write newline")?;
     writer.flush().await.context("Failed to flush writer")?;
+    Ok(())
+}
+
+async fn start_simple_socks_proxy(
+    local_port: u16, 
+    client: Arc<ConnectedClient>,
+    connections: Arc<Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+) -> Result<()> {
+    use tokio::net::TcpListener;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", local_port)).await?;
+    println!("SOCKS proxy listening on 127.0.0.1:{}", local_port);
+    
+    let connection_counter = Arc::new(AtomicU32::new(1));
+    
+    loop {
+        let (socket, addr) = listener.accept().await?;
+        println!("New SOCKS connection from {}", addr);
+        
+        let connection_id = connection_counter.fetch_add(1, Ordering::SeqCst);
+        let client_clone = client.clone();
+        let connections_clone = connections.clone();
+        
+        tokio::spawn(async move {
+            if let Err(e) = handle_socks_connection(socket, connection_id, local_port, client_clone, connections_clone).await {
+                eprintln!("SOCKS connection error: {}", e);
+            }
+        });
+    }
+}
+
+async fn handle_socks_connection(
+    socket: tokio::net::TcpStream,
+    connection_id: u32,
+    local_port: u16,
+    client: Arc<ConnectedClient>,
+    connections: Arc<Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    
+    let (mut socket_read, mut socket_write) = socket.into_split();
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    
+    // Register this connection
+    {
+        let mut conns = connections.lock().await;
+        conns.insert(connection_id, response_tx);
+    }
+    
+    // Task to read from SOCKS client and send to remote client
+    let client_clone = client.clone();
+    let read_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match socket_read.read(&mut buf).await {
+                Ok(0) => break, // Connection closed
+                Ok(n) => {
+                    let cmd = Command::SocksData {
+                        local_port,
+                        connection_id,
+                        data: buf[..n].to_vec(),
+                    };
+                    
+                    if let Err(e) = client_clone.send_command(&cmd).await {
+                        eprintln!("Failed to send SOCKS data: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("SOCKS socket read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+    
+    // Task to read responses and send to SOCKS client
+    let write_task = tokio::spawn(async move {
+        while let Some(data) = response_rx.recv().await {
+            if let Err(e) = socket_write.write_all(&data).await {
+                eprintln!("SOCKS socket write error: {}", e);
+                break;
+            }
+        }
+    });
+    
+    // Wait for either task to complete
+    tokio::select! {
+        _ = read_task => {},
+        _ = write_task => {},
+    }
+    
+    // Clean up connection
+    {
+        let mut conns = connections.lock().await;
+        conns.remove(&connection_id);
+    }
+    
+    println!("SOCKS connection {} closed", connection_id);
     Ok(())
 }
